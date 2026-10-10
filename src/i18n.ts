@@ -85,6 +85,10 @@ const zh = {
 	workspaceNotDir: (d: string) => `目录不存在或不是文件夹: ${d}`,
 	workspaceSwitched: (d: string) =>
 		`已切换全局工作区: ${d}\n(与 TUI 同进程,后续消息与工具调用都在此目录。)`,
+	workspaceSwitchedWithSession: (d: string, title: string) =>
+		`已切换全局工作区: ${d}\n已绑定该目录最新会话: ${title}\n后续消息与工具调用都在此目录。`,
+	workspaceNoSession: (d: string) =>
+		`已记录工作区: ${d}\n该目录暂无 Pi 会话,无法直接切换过去。\n请在 pi-web 里该目录新建一次会话(或 node scripts/pi-web-warmup.mjs --cwd ${d}),再 /workspace 切过去。`,
 	sessionEmpty: "当前工作区暂无会话。",
 	sessionTitle: (n: number) => `会话(共${n}个):`,
 	sessionUntitled: "暂无标题",
@@ -179,6 +183,10 @@ const en: Strings = {
 	workspaceNotDir: (d: string) => `Not an existing directory: ${d}`,
 	workspaceSwitched: (d: string) =>
 		`Switched global workspace: ${d}\n(Same process as TUI, later messages and tools run here.)`,
+	workspaceSwitchedWithSession: (d: string, title: string) =>
+		`Switched global workspace: ${d}\nBound newest session there: ${title}\nLater messages and tools run here.`,
+	workspaceNoSession: (d: string) =>
+		`Recorded workspace: ${d}\nNo Pi session in that dir yet, cannot switch over.\nCreate one session there in pi-web (or node scripts/pi-web-warmup.mjs --cwd ${d}), then /workspace again.`,
 	sessionEmpty: "No sessions in current workspace.",
 	sessionTitle: (n: number) => `Sessions (${n}):`,
 	sessionUntitled: "Untitled",

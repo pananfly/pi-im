@@ -392,12 +392,41 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 			const resolved = resolve(dir);
 			const st = await stat(resolved).catch(() => null);
 			if (!st?.isDirectory()) throw new Error(t().workspaceNotDir(resolved));
-			process.chdir(resolved);
-			// 记忆历史:写回 config.json + 更新内存缓存,下次 /wsl 可见。
+			// Pi 会话的 cwd 不可变:process.chdir 切不动,必须切到目标目录的会话。
+			// 记忆历史先落盘,切成功与否下次 /wsl 都可见。
 			try {
 				shared.workspaces = await recordWorkspace(piImDir(), resolved);
 			} catch {}
-			return t().workspaceSwitched(resolved);
+			const targets = (() => {
+				try {
+					return listWorkspaceSessionsSync(resolved);
+				} catch {
+					return [];
+				}
+			})();
+			if (targets.length === 0) return t().workspaceNoSession(resolved);
+			const cmd = shared.cmdCtx;
+			if (!cmd) throw new Error(t().sessionNoCtx);
+			const first = targets[0];
+			if (!first) return t().workspaceNoSession(resolved);
+			try {
+				await cmd.switchSession(first.file, {
+					withSession: async (next) => {
+						shared.cmdCtx = next;
+						shared.latestCtx = next;
+					},
+				});
+			} catch (e) {
+				if (isStaleCtxError(e)) {
+					shared.cmdCtx = null;
+					throw new Error(t().sessionStale);
+				}
+				throw e;
+			}
+			return t().workspaceSwitchedWithSession(
+				resolved,
+				first.title ?? first.id.slice(0, 8),
+			);
 		},
 		switchSession: async (arg: string) => {
 			const cmd = shared.cmdCtx;
