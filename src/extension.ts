@@ -2,12 +2,20 @@
 
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
+import { parseTuiArgs } from "./commands.js";
 import {
+	type ChannelKind,
+	type FeishuFileConfig,
 	piImDir,
 	resolveFeishuCredentials,
 	resolveTelegramCredentials,
+	saveJsonAtomic,
 	shouldAutoStart,
+	type TelegramFileConfig,
 } from "./config.js";
 import { ImController } from "./controller.js";
 import { SdkFeishuGateway } from "./feishu/gateway.js";
@@ -23,88 +31,452 @@ async function readJson<T>(p: string, fb: T): Promise<T> {
 	}
 }
 const SKEY = "__piImShared__";
-export default function piImExtension(pi: ExtensionAPI): void {
+interface ChannelState {
+	gateway: { stop(): Promise<void> } | null;
+	controller: ImController | null;
+}
+interface SharedState {
+	feishu: ChannelState;
+	tg: ChannelState;
+	bridge: PiAgentBridge | null;
+	autostartDone: boolean;
+	release: (() => void) | null;
+}
+function getShared(): SharedState {
 	const host = globalThis as Record<string, unknown>;
-	if (!host[SKEY])
-		host[SKEY] = { gateways: [], started: false, release: null as unknown };
-	const shared = host[SKEY] as {
-		gateways: Array<{ stop(): Promise<void> }>;
-		started: boolean;
-		release: (() => void) | null;
+	if (!host[SKEY]) {
+		host[SKEY] = {
+			feishu: { gateway: null, controller: null },
+			tg: { gateway: null, controller: null },
+			bridge: null,
+			autostartDone: false,
+			release: null,
+		};
+	}
+	return host[SKEY] as SharedState;
+}
+function notify(
+	ctx: ExtensionCommandContext,
+	msg: string,
+	kind: "info" | "warning" | "error" = "info",
+): void {
+	try {
+		ctx.ui.notify(msg, kind);
+	} catch {
+		// print-mode / RPC 下无 UI:回落到控制台,保证总有可见输出。
+		console.log(`[pi-im] ${msg}`);
+	}
+}
+function mask(s: string): string {
+	if (s.length <= 8) return "****";
+	return `${s.slice(0, 4)}…${s.slice(-4)}`;
+}
+async function validateTelegramToken(botToken: string): Promise<string> {
+	const res = await fetch(`https://api.telegram.org/bot${botToken}/getMe`, {
+		signal: AbortSignal.timeout(15000),
+	});
+	const data = (await res.json()) as {
+		ok?: boolean;
+		result?: { username?: string };
+		description?: string;
 	};
+	if (!data.ok) throw new Error(data.description ?? "Bot Token 无效");
+	return data.result?.username ?? "unknown";
+}
+function getBridge(pi: ExtensionAPI): PiAgentBridge {
+	const shared = getShared();
+	if (!shared.bridge) {
+		shared.bridge = new PiAgentBridge(async (prompt) => {
+			pi.sendUserMessage(prompt);
+		});
+	}
+	return shared.bridge;
+}
+async function startTelegram(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+): Promise<void> {
+	const shared = getShared();
+	if (shared.tg.gateway) {
+		notify(ctx, "TG Bot 已在运行中。先 /tg stop 再启动。", "warning");
+		return;
+	}
+	const dir = piImDir();
+	const file = await readJson<TelegramFileConfig>(
+		join(dir, "telegram.json"),
+		{},
+	);
+	const cred = resolveTelegramCredentials(process.env, file);
+	if (!cred) {
+		notify(
+			ctx,
+			"TG 未配置 Bot Token。请先 /tg setup <BotToken>(向 @BotFather 申请)。",
+			"warning",
+		);
+		return;
+	}
+	notify(ctx, "正在连接 Telegram…", "info");
+	const username = await validateTelegramToken(cred.botToken);
+	const gw = new TelegramGateway({ botToken: cred.botToken });
+	const c = new ImController(gw, getBridge(pi), {
+		allowlist: file.allowlist ?? [],
+		channelName: "telegram",
+	});
+	gw.onMessage((m) => void c.handleInbound(m));
+	await gw.start();
+	shared.tg.gateway = gw;
+	shared.tg.controller = c;
+	notify(ctx, `✅ TG Bot 已就绪(@${username})。私聊直回,群聊@回。`, "info");
+}
+async function stopTelegram(ctx: ExtensionCommandContext): Promise<void> {
+	const shared = getShared();
+	if (!shared.tg.gateway) {
+		notify(ctx, "TG Bot 未运行。", "warning");
+		return;
+	}
+	await shared.tg.gateway.stop().catch(() => undefined);
+	shared.tg.gateway = null;
+	shared.tg.controller = null;
+	notify(ctx, "✅ TG 长连接已停止。", "info");
+}
+async function startFeishu(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+): Promise<void> {
+	const shared = getShared();
+	if (shared.feishu.gateway) {
+		notify(ctx, "飞书 Bot 已在运行中。先 /feishu stop 再启动。", "warning");
+		return;
+	}
+	const dir = piImDir();
+	const file = await readJson<FeishuFileConfig>(join(dir, "feishu.json"), {});
+	const cred = resolveFeishuCredentials(process.env, file);
+	if (!cred) {
+		notify(
+			ctx,
+			"飞书未配置凭据。请先 /feishu setup <AppID> <AppSecret>。",
+			"warning",
+		);
+		return;
+	}
+	notify(
+		ctx,
+		"正在连接飞书…(V1 为骨架连接,真实 WebSocket 在后续任务补齐)",
+		"info",
+	);
+	const gw = new SdkFeishuGateway({
+		appId: cred.appId,
+		appSecret: cred.appSecret,
+		domain: cred.domain,
+	});
+	const c = new ImController(gw, getBridge(pi), {
+		allowlist: file.allowlist ?? [],
+		channelName: "feishu",
+	});
+	gw.onMessage((m) => void c.handleInbound(m));
+	await gw.start();
+	shared.feishu.gateway = gw;
+	shared.feishu.controller = c;
+	notify(ctx, "✅ 飞书网关已启动(V1骨架)。", "info");
+}
+async function stopFeishu(ctx: ExtensionCommandContext): Promise<void> {
+	const shared = getShared();
+	if (!shared.feishu.gateway) {
+		notify(ctx, "飞书 Bot 未运行。", "warning");
+		return;
+	}
+	await shared.feishu.gateway.stop().catch(() => undefined);
+	shared.feishu.gateway = null;
+	shared.feishu.controller = null;
+	notify(ctx, "✅ 飞书长连接已停止。", "info");
+}
+async function handleTg(
+	pi: ExtensionAPI,
+	rawArgs: string,
+	ctx: ExtensionCommandContext,
+): Promise<void> {
+	const { cmd, rest } = parseTuiArgs(rawArgs || "help");
+	const dir = piImDir();
+	try {
+		switch (cmd) {
+			case "setup": {
+				let token = rest.trim();
+				if (!token && ctx.hasUI) {
+					const input = await ctx.ui.input(
+						"TG Bot Token",
+						"向 @BotFather 申请后粘贴",
+					);
+					token = (input ?? "").trim();
+				}
+				if (!token) {
+					notify(ctx, "用法: /tg setup <BotToken>", "warning");
+					return;
+				}
+				const username = await validateTelegramToken(token);
+				const prev = await readJson<TelegramFileConfig>(
+					join(dir, "telegram.json"),
+					{},
+				);
+				await saveJsonAtomic(join(dir, "telegram.json"), {
+					...prev,
+					botToken: token,
+					autoStart: prev.autoStart ?? true,
+				});
+				notify(
+					ctx,
+					`✅ TG Token 验证成功(@${username})并已保存。正在启动…`,
+					"info",
+				);
+				await startTelegram(pi, ctx);
+				return;
+			}
+			case "start":
+				await startTelegram(pi, ctx);
+				return;
+			case "stop":
+				await stopTelegram(ctx);
+				return;
+			case "status": {
+				const file = await readJson<TelegramFileConfig>(
+					join(dir, "telegram.json"),
+					{},
+				);
+				const running = Boolean(getShared().tg.gateway);
+				const q = getShared().tg.controller?.queue.size ?? 0;
+				notify(
+					ctx,
+					`TG 状态\n  配置: ${file.botToken ? `已配置(${mask(file.botToken)})` : "未配置"}\n  连接: ${running ? "运行中" : "未运行"}\n  队列: ${q}\n  自启动: ${shouldAutoStart("telegram", process.env, file) ? "开" : "关"}`,
+					"info",
+				);
+				return;
+			}
+			case "config":
+				notify(
+					ctx,
+					`配置目录: ${dir}\n  telegram.json (0600)\n  环境变量 TELEGRAM_BOT_TOKEN / PI_IM_AUTO_START 可覆盖文件。`,
+					"info",
+				);
+				return;
+			case "logout": {
+				await stopTelegram(ctx);
+				const prev = await readJson<TelegramFileConfig>(
+					join(dir, "telegram.json"),
+					{},
+				);
+				await saveJsonAtomic(join(dir, "telegram.json"), {
+					...prev,
+					botToken: undefined,
+				});
+				notify(ctx, "TG 连接已停止,本地 Token 已清除。", "info");
+				return;
+			}
+			default:
+				notify(
+					ctx,
+					"tg 命令: setup <Token> | start | stop | status | config | logout | help",
+					"info",
+				);
+				return;
+		}
+	} catch (e) {
+		notify(
+			ctx,
+			`TG 操作失败: ${e instanceof Error ? e.message : String(e)}`,
+			"error",
+		);
+	}
+}
+async function handleFeishu(
+	pi: ExtensionAPI,
+	rawArgs: string,
+	ctx: ExtensionCommandContext,
+): Promise<void> {
+	const { cmd, rest } = parseTuiArgs(rawArgs || "help");
+	const dir = piImDir();
+	try {
+		switch (cmd) {
+			case "setup": {
+				const parts = rest.trim().split(/\s+/).filter(Boolean);
+				let appId = parts[0] ?? "";
+				let appSecret = parts[1] ?? "";
+				if ((!appId || !appSecret) && ctx.hasUI) {
+					appId =
+						appId ||
+						((await ctx.ui.input("飞书 App ID", "cli_xxx")) ?? "").trim();
+					appSecret =
+						appSecret ||
+						(
+							(await ctx.ui.input("飞书 App Secret", "粘贴 Secret")) ?? ""
+						).trim();
+				}
+				if (!appId || !appSecret) {
+					notify(ctx, "用法: /feishu setup <AppID> <AppSecret>", "warning");
+					return;
+				}
+				const prev = await readJson<FeishuFileConfig>(
+					join(dir, "feishu.json"),
+					{},
+				);
+				await saveJsonAtomic(join(dir, "feishu.json"), {
+					...prev,
+					appId,
+					appSecret,
+					domain: prev.domain ?? "feishu",
+					autoStart: prev.autoStart ?? true,
+				});
+				notify(ctx, `✅ 飞书凭据已保存: ${appId}。正在启动…`, "info");
+				await startFeishu(pi, ctx);
+				return;
+			}
+			case "start":
+				await startFeishu(pi, ctx);
+				return;
+			case "stop":
+				await stopFeishu(ctx);
+				return;
+			case "status": {
+				const file = await readJson<FeishuFileConfig>(
+					join(dir, "feishu.json"),
+					{},
+				);
+				const running = Boolean(getShared().feishu.gateway);
+				notify(
+					ctx,
+					`飞书状态\n  配置: ${file.appId ? `已配置(${file.appId})` : "未配置"}\n  连接: ${running ? "运行中" : "未运行"}\n  自启动: ${shouldAutoStart("feishu" as ChannelKind, process.env, file) ? "开" : "关"}`,
+					"info",
+				);
+				return;
+			}
+			case "config":
+				notify(
+					ctx,
+					`配置目录: ${dir}\n  feishu.json (0600)\n  环境变量 FEISHU_APP_ID / FEISHU_APP_SECRET / PI_IM_AUTO_START 可覆盖文件。`,
+					"info",
+				);
+				return;
+			case "logout": {
+				await stopFeishu(ctx);
+				const prev = await readJson<FeishuFileConfig>(
+					join(dir, "feishu.json"),
+					{},
+				);
+				await saveJsonAtomic(join(dir, "feishu.json"), {
+					...prev,
+					appId: undefined,
+					appSecret: undefined,
+				});
+				notify(ctx, "飞书连接已停止,本地凭据已清除。", "info");
+				return;
+			}
+			default:
+				notify(
+					ctx,
+					"feishu 命令: setup <ID> <Secret> | start | stop | status | config | logout | help",
+					"info",
+				);
+				return;
+		}
+	} catch (e) {
+		notify(
+			ctx,
+			`飞书操作失败: ${e instanceof Error ? e.message : String(e)}`,
+			"error",
+		);
+	}
+}
+export default function piImExtension(pi: ExtensionAPI): void {
+	getShared();
 	pi.registerCommand("feishu", {
 		description: "pi-im feishu setup|start|stop|status|config|logout|help",
 		handler: async (args, ctx) => {
-			ctx.ui.notify(`feishu ${args ?? ""} (V1最小实现)`, "info");
+			await handleFeishu(pi, args ?? "", ctx);
 		},
 	});
 	pi.registerCommand("tg", {
 		description: "pi-im tg setup|start|stop|status|config|logout|help",
 		handler: async (args, ctx) => {
-			ctx.ui.notify(`tg ${args ?? ""} (V1最小实现)`, "info");
+			await handleTg(pi, args ?? "", ctx);
 		},
 	});
-	let latest: unknown;
-	const track = (_e: unknown, ctx: unknown) => {
-		latest = ctx;
-	};
 	pi.on("session_start", (event, context) => {
-		track(event, context);
+		void event;
 		void (async () => {
-			if (shared.started) return;
+			const shared = getShared();
+			if (shared.autostartDone) return;
+			shared.autostartDone = true;
 			const dir = piImDir();
-			const feishuFile = await readJson(join(dir, "feishu.json"), {});
-			const tgFile = await readJson(join(dir, "telegram.json"), {});
-			const bridge = new PiAgentBridge(async (prompt) => {
-				pi.sendUserMessage(prompt);
-			});
-			void bridge;
-			void latest;
-			const fCred = resolveFeishuCredentials(process.env, feishuFile as never);
-			if (
-				fCred &&
-				shouldAutoStart("feishu", process.env, feishuFile as never)
-			) {
-				const gw = new SdkFeishuGateway({
-					appId: fCred.appId,
-					appSecret: fCred.appSecret,
-					domain: fCred.domain,
-				});
-				await gw.start().catch(() => undefined);
-				const c = new ImController(gw, bridge, {
-					allowlist: [],
-					channelName: "feishu",
-				});
-				gw.onMessage((m) => void c.handleInbound(m));
-				shared.gateways.push(gw);
+			const feishuFile = await readJson<FeishuFileConfig>(
+				join(dir, "feishu.json"),
+				{},
+			);
+			const tgFile = await readJson<TelegramFileConfig>(
+				join(dir, "telegram.json"),
+				{},
+			);
+			getBridge(pi);
+			const fCred = resolveFeishuCredentials(process.env, feishuFile);
+			if (fCred && shouldAutoStart("feishu", process.env, feishuFile)) {
+				await startFeishuSilent(pi, fCred, feishuFile).catch(() => undefined);
 			}
-			const tCred = resolveTelegramCredentials(process.env, tgFile as never);
-			if (tCred && shouldAutoStart("telegram", process.env, tgFile as never)) {
-				const gw = new TelegramGateway({ botToken: tCred.botToken });
-				await gw.start().catch(() => undefined);
-				const c = new ImController(gw, bridge, {
-					allowlist: [],
-					channelName: "telegram",
-				});
-				gw.onMessage((m) => void c.handleInbound(m));
-				shared.gateways.push(gw);
+			const tCred = resolveTelegramCredentials(process.env, tgFile);
+			if (tCred && shouldAutoStart("telegram", process.env, tgFile)) {
+				await startTelegramSilent(pi, tCred, tgFile).catch(() => undefined);
 			}
-			shared.started = true;
 			const sid = (context as { sessionId?: string }).sessionId ?? "holder";
 			shared.release?.();
 			shared.release = registerPiWebLiveness(
 				sid,
-				() => shared.gateways.length > 0,
+				() => Boolean(shared.feishu.gateway) || Boolean(shared.tg.gateway),
 			);
 		})().catch((e) => {
-			(context.ui as { notify(msg: string, kind: string): void }).notify(
-				`pi-im自启动失败:${String(e)}`,
+			notify(
+				context as ExtensionCommandContext,
+				`pi-im自启动失败:${e instanceof Error ? e.message : String(e)}`,
 				"error",
 			);
 		});
 	});
 	pi.on("message_end", (e, c) => {
-		track(e, c);
+		void e;
+		void c;
 	});
 	pi.on("session_shutdown", () => {});
+}
+async function startTelegramSilent(
+	pi: ExtensionAPI,
+	cred: { botToken: string },
+	file: TelegramFileConfig,
+): Promise<void> {
+	const shared = getShared();
+	if (shared.tg.gateway) return;
+	const gw = new TelegramGateway({ botToken: cred.botToken });
+	const c = new ImController(gw, getBridge(pi), {
+		allowlist: file.allowlist ?? [],
+		channelName: "telegram",
+	});
+	gw.onMessage((m) => void c.handleInbound(m));
+	await gw.start();
+	shared.tg.gateway = gw;
+	shared.tg.controller = c;
+}
+async function startFeishuSilent(
+	pi: ExtensionAPI,
+	cred: { appId: string; appSecret: string; domain: "feishu" | "lark" },
+	file: FeishuFileConfig,
+): Promise<void> {
+	const shared = getShared();
+	if (shared.feishu.gateway) return;
+	const gw = new SdkFeishuGateway({
+		appId: cred.appId,
+		appSecret: cred.appSecret,
+		domain: cred.domain,
+	});
+	const c = new ImController(gw, getBridge(pi), {
+		allowlist: file.allowlist ?? [],
+		channelName: "feishu",
+	});
+	gw.onMessage((m) => void c.handleInbound(m));
+	await gw.start();
+	shared.feishu.gateway = gw;
+	shared.feishu.controller = c;
 }
