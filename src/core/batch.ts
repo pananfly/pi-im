@@ -1,23 +1,30 @@
+import { getStrings, type Locale } from "../i18n.js";
+
 export class BatchCollector {
 	private active = new Set<string>();
 	private items = new Map<string, string[]>();
+	constructor(private locale: Locale = "zh") {}
+	setLocale(locale: Locale): void {
+		this.locale = locale;
+	}
+	private get s() {
+		return getStrings(this.locale);
+	}
 	start(chatId: string): string {
 		this.active.add(chatId);
 		this.items.set(chatId, []);
-		return "批量输入已开启,后续纯文字将暂存最多10条,/send 提交,/cancel 取消。";
+		return this.s.batchStart;
 	}
 	isActive(chatId: string): boolean {
 		return this.active.has(chatId);
 	}
 	collect(chatId: string, text: string): string {
-		if (!this.active.has(chatId)) return "未进入批量输入模式。";
+		if (!this.active.has(chatId)) return this.s.batchIdle;
 		const arr = this.items.get(chatId) ?? [];
-		if (arr.length >= 10) return "已收录10条,请 /send 提交。";
+		if (arr.length >= 10) return this.s.batchFull;
 		arr.push(text);
 		this.items.set(chatId, arr);
-		return arr.length >= 10
-			? "已收录第10条,请 /send 提交。"
-			: `已收录第${arr.length}条。`;
+		return this.s.batchCollected(arr.length);
 	}
 	submit(chatId: string): string {
 		const arr = this.items.get(chatId) ?? [];

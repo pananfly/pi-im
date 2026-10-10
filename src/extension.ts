@@ -10,7 +10,10 @@ import { parseTuiArgs } from "./commands.js";
 import {
 	type ChannelKind,
 	type FeishuFileConfig,
+	mergeWorkspaces,
 	piImDir,
+	readPiImConfig,
+	recordWorkspace,
 	resolveFeishuCredentials,
 	resolveTelegramCredentials,
 	saveJsonAtomic,
@@ -19,6 +22,7 @@ import {
 } from "./config.js";
 import { ImController } from "./controller.js";
 import { SdkFeishuGateway } from "./feishu/gateway.js";
+import { getStrings, type Locale, resolveLocale } from "./i18n.js";
 import { registerPiWebLiveness } from "./liveness.js";
 import { PiAgentBridge } from "./pi-bridge.js";
 import { TelegramGateway } from "./telegram/gateway.js";
@@ -43,6 +47,8 @@ interface SharedState {
 	release: (() => void) | null;
 	latestCtx: import("@earendil-works/pi-coding-agent").ExtensionContext | null;
 	cmdCtx: ExtensionCommandContext | null;
+	locale: Locale;
+	workspaces: string[];
 }
 function getShared(): SharedState {
 	const host = globalThis as Record<string, unknown>;
@@ -55,9 +61,23 @@ function getShared(): SharedState {
 			release: null,
 			latestCtx: null,
 			cmdCtx: null,
+			locale: "zh" as Locale,
+			workspaces: [],
 		};
 	}
-	return host[SKEY] as SharedState;
+	const s = host[SKEY] as SharedState;
+	if (!s.locale) s.locale = "zh";
+	if (!s.workspaces) s.workspaces = [];
+	return s;
+}
+/** Refresh locale + workspace history from disk (called on commands/autostart). */
+async function refreshSharedMeta(): Promise<void> {
+	const shared = getShared();
+	const dir = piImDir();
+	const cfg = await readPiImConfig(dir);
+	shared.locale = resolveLocale(process.env, cfg);
+	const cur = shared.latestCtx?.cwd ?? process.cwd();
+	shared.workspaces = mergeWorkspaces(cfg.workspaces, cur);
 }
 function notify(
 	ctx: ExtensionCommandContext,
@@ -90,14 +110,25 @@ async function validateTelegramToken(botToken: string): Promise<string> {
 function getBridge(pi: ExtensionAPI): PiAgentBridge {
 	const shared = getShared();
 	if (!shared.bridge) {
-		shared.bridge = new PiAgentBridge(async (prompt) => {
-			pi.sendUserMessage(prompt);
-		});
+		shared.bridge = new PiAgentBridge(
+			async (prompt) => {
+				pi.sendUserMessage(prompt);
+			},
+			async (text) => {
+				try {
+					pi.sendUserMessage(text, { deliverAs: "steer" });
+					return true;
+				} catch {
+					return false;
+				}
+			},
+		);
 	}
 	return shared.bridge;
 }
 function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 	const shared = getShared();
+	const t = () => getStrings(shared.locale);
 	c.runtime = {
 		newSession: async () => {
 			const cmd = shared.cmdCtx;
@@ -192,13 +223,13 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 		},
 		switchModel: async (query: string) => {
 			const ctx = shared.latestCtx;
-			if (!ctx) throw new Error("本地会话尚未就绪。");
+			if (!ctx) throw new Error(t().modelNoSession);
 			const q = query.trim();
 			let target: { id?: string; name?: string } | undefined;
 			if (/^\d+$/.test(q)) {
 				const list = c.runtime?.listModels?.() ?? [];
 				target = list[Number(q) - 1];
-				if (!target) throw new Error(`序号 ${q} 超出范围,先 /models 查看。`);
+				if (!target) throw new Error(t().modelIndexOut(q));
 			} else {
 				const scoped = (ctx.scopedModels ?? []) as unknown as Array<{
 					id?: string;
@@ -241,9 +272,8 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 							(m.name ?? "").toLowerCase().includes(q.toLowerCase()),
 					);
 					if (fuzzy.length === 1 && fuzzy[0]) target = fuzzy[0];
-					else if (fuzzy.length === 0)
-						throw new Error(`未找到匹配"${q}"的模型。`);
-					else throw new Error(`"${q}"匹配到多个模型,请用完整 ID。`);
+					else if (fuzzy.length === 0) throw new Error(t().modelNotFound(q));
+					else throw new Error(t().modelAmbiguous(q));
 				}
 			}
 			const full = (() => {
@@ -258,9 +288,9 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 					return undefined;
 				}
 			})();
-			if (!full) throw new Error("模型不在本地目录中,无法切换。");
+			if (!full) throw new Error(t().modelNotInCatalog);
 			const ok = await pi.setModel(full);
-			if (!ok) throw new Error("模型缺少可用的 API Key。");
+			if (!ok) throw new Error(t().modelNoKey);
 			const mm = full as { id?: string; name?: string; provider?: unknown };
 			return {
 				id: String(mm.id ?? q),
@@ -308,7 +338,7 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 		},
 		listWorkspaces: () => {
 			const cur = shared.latestCtx?.cwd ?? process.cwd();
-			return [cur];
+			return mergeWorkspaces(shared.workspaces, cur);
 		},
 		listSessions: () => {
 			try {
@@ -333,31 +363,31 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 			if (/^\d+$/.test(dir)) {
 				const list = c.runtime?.listWorkspaces?.() ?? [];
 				const hit = list[Number(dir) - 1];
-				if (!hit) throw new Error(`序号 ${dir} 超出范围。`);
+				if (!hit) throw new Error(t().workspaceIndexOut(dir));
 				dir = hit;
 			}
 			const resolved = resolve(dir);
 			const st = await stat(resolved).catch(() => null);
-			if (!st?.isDirectory())
-				throw new Error(`目录不存在或不是文件夹: ${resolved}`);
+			if (!st?.isDirectory()) throw new Error(t().workspaceNotDir(resolved));
 			process.chdir(resolved);
-			return `已切换全局工作区: ${resolved}\n(与 TUI 同进程,后续消息与工具调用都在此目录。)`;
+			// 记忆历史:写回 config.json + 更新内存缓存,下次 /wsl 可见。
+			try {
+				shared.workspaces = await recordWorkspace(piImDir(), resolved);
+			} catch {}
+			return t().workspaceSwitched(resolved);
 		},
 		switchSession: async (arg: string) => {
 			const cmd = shared.cmdCtx;
-			if (!cmd)
-				throw new Error(
-					"本地暂无可用的会话切换上下文,请先在 TUI 执行一次 /tg status 后重试。",
-				);
+			if (!cmd) throw new Error(t().sessionNoCtx);
 			const list = c.runtime?.listSessions?.() ?? [];
 			let target = arg.trim();
 			if (/^\d+$/.test(target)) {
 				const hit = list[Number(target) - 1];
-				if (!hit) throw new Error(`序号 ${target} 超出范围。`);
+				if (!hit) throw new Error(t().sessionIndexOut(target));
 				target = hit.id;
 			}
 			await cmd.switchSession(target);
-			return `已绑定会话: ${target}`;
+			return t().sessionBound(target);
 		},
 	};
 }
@@ -390,6 +420,7 @@ async function startTelegram(
 	const c = new ImController(gw, getBridge(pi), {
 		allowlist: file.allowlist ?? [],
 		channelName: "telegram",
+		locale: shared.locale,
 	});
 	attachRuntime(pi, c);
 	gw.onMessage((m) => void c.handleInbound(m));
@@ -430,11 +461,7 @@ async function startFeishu(
 		);
 		return;
 	}
-	notify(
-		ctx,
-		"正在连接飞书…(V1 为骨架连接,真实 WebSocket 在后续任务补齐)",
-		"info",
-	);
+	notify(ctx, "正在连接飞书…(WebSocket 长连接)", "info");
 	const gw = new SdkFeishuGateway({
 		appId: cred.appId,
 		appSecret: cred.appSecret,
@@ -443,6 +470,7 @@ async function startFeishu(
 	const c = new ImController(gw, getBridge(pi), {
 		allowlist: file.allowlist ?? [],
 		channelName: "feishu",
+		locale: shared.locale,
 	});
 	attachRuntime(pi, c);
 	gw.onMessage((m) => void c.handleInbound(m));
@@ -450,7 +478,7 @@ async function startFeishu(
 	shared.feishu.gateway = gw;
 	shared.feishu.controller = c;
 	shared.cmdCtx = ctx;
-	notify(ctx, "✅ 飞书网关已启动(V1骨架)。", "info");
+	notify(ctx, "✅ 飞书网关已启动(WebSocket)。私聊直回,群聊@回。", "info");
 }
 async function stopFeishu(ctx: ExtensionCommandContext): Promise<void> {
 	const shared = getShared();
@@ -471,6 +499,7 @@ async function handleTg(
 	const { cmd, rest } = parseTuiArgs(rawArgs || "help");
 	const dir = piImDir();
 	getShared().cmdCtx = ctx;
+	await refreshSharedMeta().catch(() => undefined);
 	try {
 		switch (cmd) {
 			case "setup": {
@@ -568,6 +597,7 @@ async function handleFeishu(
 	const { cmd, rest } = parseTuiArgs(rawArgs || "help");
 	const dir = piImDir();
 	getShared().cmdCtx = ctx;
+	await refreshSharedMeta().catch(() => undefined);
 	try {
 		switch (cmd) {
 			case "setup": {
@@ -680,6 +710,7 @@ export default function piImExtension(pi: ExtensionAPI): void {
 			const shared = getShared();
 			if (shared.autostartDone) return;
 			shared.autostartDone = true;
+			await refreshSharedMeta().catch(() => undefined);
 			const dir = piImDir();
 			const feishuFile = await readJson<FeishuFileConfig>(
 				join(dir, "feishu.json"),
@@ -716,8 +747,9 @@ export default function piImExtension(pi: ExtensionAPI): void {
 		getShared().latestCtx = c;
 		getShared().bridge?.captureMessage(e.message as never);
 	});
-	pi.on("message_update", (_e, c) => {
+	pi.on("message_update", (e, c) => {
 		getShared().latestCtx = c;
+		getShared().bridge?.captureStreamingMessage(e.message as never);
 	});
 	pi.on("tool_execution_start", (e, c) => {
 		getShared().latestCtx = c;
@@ -744,6 +776,7 @@ async function startTelegramSilent(
 	const c = new ImController(gw, getBridge(pi), {
 		allowlist: file.allowlist ?? [],
 		channelName: "telegram",
+		locale: shared.locale,
 	});
 	attachRuntime(pi, c);
 	gw.onMessage((m) => void c.handleInbound(m));
@@ -766,6 +799,7 @@ async function startFeishuSilent(
 	const c = new ImController(gw, getBridge(pi), {
 		allowlist: file.allowlist ?? [],
 		channelName: "feishu",
+		locale: shared.locale,
 	});
 	attachRuntime(pi, c);
 	gw.onMessage((m) => void c.handleInbound(m));

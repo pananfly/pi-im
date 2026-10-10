@@ -1,4 +1,4 @@
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 export type ChannelKind = "feishu" | "telegram";
@@ -6,6 +6,7 @@ export interface PiImFileConfig {
 	workspaces?: string[];
 	holderSessionId?: string;
 	holderCwd?: string;
+	locale?: string;
 }
 export interface FeishuFileConfig {
 	appId?: string;
@@ -64,4 +65,41 @@ export function resolveTelegramCredentials(
 	const botToken = env.TELEGRAM_BOT_TOKEN ?? file.botToken;
 	if (!botToken) return null;
 	return { botToken };
+}
+
+/** Read config.json (never throws, returns {} on missing/corrupt). */
+export async function readPiImConfig(
+	dir: string = piImDir(),
+): Promise<PiImFileConfig> {
+	try {
+		const raw = await readFile(join(dir, "config.json"), "utf8");
+		const parsed = JSON.parse(raw) as PiImFileConfig;
+		if (parsed && typeof parsed === "object") return parsed;
+		return {};
+	} catch {
+		return {};
+	}
+}
+
+/** Merge stored history with current cwd: current first, then history, deduped. */
+export function mergeWorkspaces(
+	stored: string[] | undefined,
+	current: string,
+): string[] {
+	const out: string[] = [current];
+	for (const w of stored ?? []) {
+		if (w !== current && !out.includes(w)) out.push(w);
+	}
+	return out;
+}
+
+/** Record a workspace dir into config.json history (prepend, dedupe, cap 20). */
+export async function recordWorkspace(
+	dir: string,
+	cwd: string,
+): Promise<string[]> {
+	const prev = await readPiImConfig(dir);
+	const next = mergeWorkspaces(prev.workspaces, cwd).slice(0, 20);
+	await saveJsonAtomic(join(dir, "config.json"), { ...prev, workspaces: next });
+	return next;
 }

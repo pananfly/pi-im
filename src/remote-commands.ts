@@ -1,4 +1,4 @@
-// src/remote-commands.ts
+import { getStrings, type Locale } from "./i18n.js";
 export interface ParsedRemoteCommand {
 	name: string;
 	args: string;
@@ -39,10 +39,8 @@ export function parseRemoteCommand(
 		return { name, args: i === -1 ? "" : t.slice(i + 1).trim() };
 	return { name, args: i === -1 ? "" : t.slice(i + 1).trim() };
 }
-export function renderHelp(): string {
-	return [
-		"/help /status /version /new /stop /steer <文本> /compact /history [N] /models /model [序号|ID] /thinking [ID] (/reasoning) /workspace <路径|序号> (/ws) /wsl /sessionlist (/sessions) /session <ID|序号> /batch /send /cancel /repair /clear",
-	].join("\n");
+export function renderHelp(locale: Locale = "zh"): string {
+	return [getStrings(locale).help].join("\n");
 }
 export function formatHistoryPreview(items: string[], n: number): string {
 	const capped = Math.min(Math.max(n || 3, 1), 5);
