@@ -99,6 +99,9 @@ const zh = {
 	sessionBound: (id: string) => `已绑定会话: ${id}`,
 	sessionNoCtx:
 		"本地暂无可用的会话切换上下文,请先在 TUI 执行一次 /tg status 后重试。",
+	sessionCancelled: "切换已取消(本地拦截了会话切换,请检查信任确认后重试)。",
+	workspaceCancelled:
+		"工作区切换已取消(本地拦截了会话切换,请检查信任确认后重试)。",
 	sessionStale:
 		"本地 Pi 会话控制已过期（本地发生过会话切换）。请在 Pi Web/TUI 执行一次 /tg status 刷新，然后重发这条消息。",
 	newBusy: "任务运行中,请先 /stop 再 /new。",
@@ -198,6 +201,10 @@ const en: Strings = {
 	sessionBound: (id: string) => `Bound session: ${id}`,
 	sessionNoCtx:
 		"No session-switch context yet, run /tg status once in TUI first.",
+	sessionCancelled:
+		"Switch cancelled (blocked locally, check trust confirmation and retry).",
+	workspaceCancelled:
+		"Workspace switch cancelled (blocked locally, check trust confirmation and retry).",
 	sessionStale:
 		"Local Pi session control expired (session switched locally). Run /tg status once in Pi Web/TUI to refresh, then resend.",
 	newBusy: "Task running, /stop first then /new.",

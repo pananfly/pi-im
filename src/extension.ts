@@ -409,13 +409,16 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 			if (!cmd) throw new Error(t().sessionNoCtx);
 			const first = targets[0];
 			if (!first) return t().workspaceNoSession(resolved);
+			let switched = false;
 			try {
-				await cmd.switchSession(first.file, {
+				const result = await cmd.switchSession(first.file, {
 					withSession: async (next) => {
 						shared.cmdCtx = next;
 						shared.latestCtx = next;
+						switched = true;
 					},
 				});
+				if (result.cancelled) throw new Error(t().workspaceCancelled);
 			} catch (e) {
 				if (isStaleCtxError(e)) {
 					shared.cmdCtx = null;
@@ -423,6 +426,7 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 				}
 				throw e;
 			}
+			if (!switched) throw new Error(t().workspaceCancelled);
 			return t().workspaceSwitchedWithSession(
 				resolved,
 				first.title ?? first.id.slice(0, 8),
@@ -448,13 +452,16 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 			}
 			if (!target) throw new Error(t().sessionIndexOut(q));
 			// Pi switchSession expects the session FILE path, not the id.
+			let switched = false;
 			try {
-				await cmd.switchSession(target, {
+				const result = await cmd.switchSession(target, {
 					withSession: async (next) => {
 						shared.cmdCtx = next;
 						shared.latestCtx = next;
+						switched = true;
 					},
 				});
+				if (result.cancelled) throw new Error(t().sessionCancelled);
 			} catch (e) {
 				if (isStaleCtxError(e)) {
 					shared.cmdCtx = null;
@@ -462,6 +469,7 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 				}
 				throw e;
 			}
+			if (!switched) throw new Error(t().sessionCancelled);
 			return t().sessionBound(target);
 		},
 	};
