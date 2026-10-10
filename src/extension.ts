@@ -73,7 +73,10 @@ function getShared(): SharedState {
 	const s = host[SKEY] as SharedState;
 	if (!s.locale) s.locale = "zh";
 	if (!s.workspaces) s.workspaces = [];
-	if (!("holderFile" in s)) s.holderFile = null;
+	// 热更新兼容：旧版 globalThis 里没有 holderFile。
+	if ((s as unknown as Record<string, unknown>)["holderFile"] === undefined) {
+		s.holderFile = null;
+	}
 	return s;
 }
 /** 安全读取会话文件路径（stale ctx 可能抛错）。 */
