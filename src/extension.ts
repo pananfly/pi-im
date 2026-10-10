@@ -41,6 +41,8 @@ interface SharedState {
 	bridge: PiAgentBridge | null;
 	autostartDone: boolean;
 	release: (() => void) | null;
+	latestCtx: import("@earendil-works/pi-coding-agent").ExtensionContext | null;
+	cmdCtx: ExtensionCommandContext | null;
 }
 function getShared(): SharedState {
 	const host = globalThis as Record<string, unknown>;
@@ -51,6 +53,8 @@ function getShared(): SharedState {
 			bridge: null,
 			autostartDone: false,
 			release: null,
+			latestCtx: null,
+			cmdCtx: null,
 		};
 	}
 	return host[SKEY] as SharedState;
@@ -92,6 +96,271 @@ function getBridge(pi: ExtensionAPI): PiAgentBridge {
 	}
 	return shared.bridge;
 }
+function attachRuntime(pi: ExtensionAPI, c: ImController): void {
+	const shared = getShared();
+	c.runtime = {
+		newSession: async () => {
+			const cmd = shared.cmdCtx;
+			if (!cmd) return false;
+			try {
+				const r = await cmd.newSession();
+				return !r.cancelled;
+			} catch {
+				return false;
+			}
+		},
+		compact: () => {
+			try {
+				shared.latestCtx?.compact();
+			} catch {}
+		},
+		abort: () => {
+			try {
+				shared.latestCtx?.abort();
+			} catch {}
+		},
+		cwd: () => shared.latestCtx?.cwd ?? process.cwd(),
+		sessionFile: () => {
+			try {
+				return shared.latestCtx?.sessionManager.getSessionFile() ?? undefined;
+			} catch {
+				return undefined;
+			}
+		},
+		model: () => {
+			const m = shared.latestCtx?.model as
+				| { id?: string; name?: string; provider?: string }
+				| undefined;
+			if (!m?.id) return undefined;
+			return {
+				id: m.id,
+				name: m.name,
+				provider: typeof m.provider === "string" ? m.provider : undefined,
+			};
+		},
+		thinking: () => {
+			const t = shared.latestCtx?.thinkingLevel;
+			return typeof t === "string" ? t : undefined;
+		},
+		contextPercent: () => {
+			try {
+				const u = shared.latestCtx?.getContextUsage() as
+					| { percent?: number }
+					| undefined;
+				return typeof u?.percent === "number" ? u.percent : undefined;
+			} catch {
+				return undefined;
+			}
+		},
+		isRunning: () => {
+			const idle = shared.latestCtx?.isIdle();
+			return typeof idle === "boolean" ? !idle : false;
+		},
+		listModels: () => {
+			const ctx = shared.latestCtx;
+			if (!ctx) return [];
+			const scoped = (ctx.scopedModels ?? []) as unknown as Array<{
+				id?: string;
+				name?: string;
+				provider?: string;
+			}>;
+			if (scoped.length > 0) {
+				return scoped
+					.map((s) => ({
+						id: String(s.id ?? s.name ?? ""),
+						name: s.name,
+						provider: s.provider,
+					}))
+					.filter((x) => x.id);
+			}
+			try {
+				const all = ctx.modelRegistry.getAvailable() as Array<{
+					id?: string;
+					name?: string;
+					provider?: unknown;
+				}>;
+				return all
+					.map((m) => ({
+						id: String(m.id ?? m.name ?? ""),
+						name: m.name,
+						provider: typeof m.provider === "string" ? m.provider : undefined,
+					}))
+					.filter((x) => x.id);
+			} catch {
+				return [];
+			}
+		},
+		switchModel: async (query: string) => {
+			const ctx = shared.latestCtx;
+			if (!ctx) throw new Error("本地会话尚未就绪。");
+			const q = query.trim();
+			let target: { id?: string; name?: string } | undefined;
+			if (/^\d+$/.test(q)) {
+				const list = c.runtime?.listModels?.() ?? [];
+				target = list[Number(q) - 1];
+				if (!target) throw new Error(`序号 ${q} 超出范围,先 /models 查看。`);
+			} else {
+				const scoped = (ctx.scopedModels ?? []) as unknown as Array<{
+					id?: string;
+					name?: string;
+				}>;
+				target =
+					scoped.find((s) => s.id === q || s.name === q) ??
+					(() => {
+						try {
+							return ctx.modelRegistry
+								.getAvailable()
+								.find(
+									(m) =>
+										(m as { id?: string }).id === q ||
+										(m as { name?: string }).name === q,
+								) as unknown as { id?: string; name?: string } | undefined;
+						} catch {
+							return undefined;
+						}
+					})();
+				if (!target) {
+					// 模糊匹配 id/name 包含
+					const pool = (
+						scoped.length > 0
+							? scoped
+							: (() => {
+									try {
+										return ctx.modelRegistry.getAvailable() as unknown as Array<{
+											id?: string;
+											name?: string;
+										}>;
+									} catch {
+										return [];
+									}
+								})()
+					) as Array<{ id?: string; name?: string }>;
+					const fuzzy = pool.filter(
+						(m) =>
+							(m.id ?? "").toLowerCase().includes(q.toLowerCase()) ||
+							(m.name ?? "").toLowerCase().includes(q.toLowerCase()),
+					);
+					if (fuzzy.length === 1 && fuzzy[0]) target = fuzzy[0];
+					else if (fuzzy.length === 0)
+						throw new Error(`未找到匹配"${q}"的模型。`);
+					else throw new Error(`"${q}"匹配到多个模型,请用完整 ID。`);
+				}
+			}
+			const full = (() => {
+				try {
+					return ctx.modelRegistry
+						.getAvailable()
+						.find(
+							(m) =>
+								(m as { id?: string }).id === (target as { id?: string }).id,
+						);
+				} catch {
+					return undefined;
+				}
+			})();
+			if (!full) throw new Error("模型不在本地目录中,无法切换。");
+			const ok = await pi.setModel(full);
+			if (!ok) throw new Error("模型缺少可用的 API Key。");
+			const mm = full as { id?: string; name?: string; provider?: unknown };
+			return {
+				id: String(mm.id ?? q),
+				name: mm.name,
+				provider: typeof mm.provider === "string" ? mm.provider : undefined,
+			};
+		},
+		setThinking: (level: string) => {
+			const lv = level.toLowerCase() as unknown as Parameters<
+				import("@earendil-works/pi-coding-agent").ExtensionAPI["setThinkingLevel"]
+			>[0];
+			try {
+				pi.setThinkingLevel(lv);
+				return true;
+			} catch {
+				return false;
+			}
+		},
+		readHistory: (n: number) => {
+			try {
+				const entries = shared.latestCtx?.sessionManager.getEntries() as
+					| Array<{
+							role?: string;
+							content?: Array<{ type?: string; text?: string }> | string;
+					  }>
+					| undefined;
+				if (!entries) return [];
+				const out: string[] = [];
+				for (const e of entries) {
+					if (e.role !== "user" && e.role !== "assistant") continue;
+					let text = "";
+					if (typeof e.content === "string") text = e.content;
+					else if (Array.isArray(e.content)) {
+						text = e.content
+							.filter((p) => p.type === "text" && p.text)
+							.map((p) => p.text as string)
+							.join("\n");
+					}
+					if (text.trim()) out.push(text);
+				}
+				return out.slice(-n);
+			} catch {
+				return [];
+			}
+		},
+		listWorkspaces: () => {
+			const cur = shared.latestCtx?.cwd ?? process.cwd();
+			return [cur];
+		},
+		listSessions: () => {
+			try {
+				const sm = shared.latestCtx?.sessionManager as unknown as
+					| {
+							getSessionId?: () => string;
+							getSessionFile?: () => string | undefined;
+					  }
+					| undefined;
+				const id = sm?.getSessionId?.() ?? "";
+				const file = sm?.getSessionFile?.() ?? "";
+				if (!id && !file) return [];
+				return [{ id: id || file, title: undefined }];
+			} catch {
+				return [];
+			}
+		},
+		switchWorkspace: async (arg: string) => {
+			const { stat } = await import("node:fs/promises");
+			const { resolve } = await import("node:path");
+			let dir = arg.trim();
+			if (/^\d+$/.test(dir)) {
+				const list = c.runtime?.listWorkspaces?.() ?? [];
+				const hit = list[Number(dir) - 1];
+				if (!hit) throw new Error(`序号 ${dir} 超出范围。`);
+				dir = hit;
+			}
+			const resolved = resolve(dir);
+			const st = await stat(resolved).catch(() => null);
+			if (!st?.isDirectory())
+				throw new Error(`目录不存在或不是文件夹: ${resolved}`);
+			process.chdir(resolved);
+			return `已切换全局工作区: ${resolved}\n(与 TUI 同进程,后续消息与工具调用都在此目录。)`;
+		},
+		switchSession: async (arg: string) => {
+			const cmd = shared.cmdCtx;
+			if (!cmd)
+				throw new Error(
+					"本地暂无可用的会话切换上下文,请先在 TUI 执行一次 /tg status 后重试。",
+				);
+			const list = c.runtime?.listSessions?.() ?? [];
+			let target = arg.trim();
+			if (/^\d+$/.test(target)) {
+				const hit = list[Number(target) - 1];
+				if (!hit) throw new Error(`序号 ${target} 超出范围。`);
+				target = hit.id;
+			}
+			await cmd.switchSession(target);
+			return `已绑定会话: ${target}`;
+		},
+	};
+}
 async function startTelegram(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -122,10 +391,12 @@ async function startTelegram(
 		allowlist: file.allowlist ?? [],
 		channelName: "telegram",
 	});
+	attachRuntime(pi, c);
 	gw.onMessage((m) => void c.handleInbound(m));
 	await gw.start();
 	shared.tg.gateway = gw;
 	shared.tg.controller = c;
+	shared.cmdCtx = ctx;
 	notify(ctx, `✅ TG Bot 已就绪(@${username})。私聊直回,群聊@回。`, "info");
 }
 async function stopTelegram(ctx: ExtensionCommandContext): Promise<void> {
@@ -173,10 +444,12 @@ async function startFeishu(
 		allowlist: file.allowlist ?? [],
 		channelName: "feishu",
 	});
+	attachRuntime(pi, c);
 	gw.onMessage((m) => void c.handleInbound(m));
 	await gw.start();
 	shared.feishu.gateway = gw;
 	shared.feishu.controller = c;
+	shared.cmdCtx = ctx;
 	notify(ctx, "✅ 飞书网关已启动(V1骨架)。", "info");
 }
 async function stopFeishu(ctx: ExtensionCommandContext): Promise<void> {
@@ -197,6 +470,7 @@ async function handleTg(
 ): Promise<void> {
 	const { cmd, rest } = parseTuiArgs(rawArgs || "help");
 	const dir = piImDir();
+	getShared().cmdCtx = ctx;
 	try {
 		switch (cmd) {
 			case "setup": {
@@ -293,6 +567,7 @@ async function handleFeishu(
 ): Promise<void> {
 	const { cmd, rest } = parseTuiArgs(rawArgs || "help");
 	const dir = piImDir();
+	getShared().cmdCtx = ctx;
 	try {
 		switch (cmd) {
 			case "setup": {
@@ -400,6 +675,7 @@ export default function piImExtension(pi: ExtensionAPI): void {
 	});
 	pi.on("session_start", (event, context) => {
 		void event;
+		getShared().latestCtx = context;
 		void (async () => {
 			const shared = getShared();
 			if (shared.autostartDone) return;
@@ -437,8 +713,23 @@ export default function piImExtension(pi: ExtensionAPI): void {
 		});
 	});
 	pi.on("message_end", (e, c) => {
-		void e;
-		void c;
+		getShared().latestCtx = c;
+		getShared().bridge?.captureMessage(e.message as never);
+	});
+	pi.on("message_update", (_e, c) => {
+		getShared().latestCtx = c;
+	});
+	pi.on("tool_execution_start", (e, c) => {
+		getShared().latestCtx = c;
+		getShared().bridge?.captureToolStart(e.toolName as string);
+	});
+	pi.on("tool_execution_end", (_e, c) => {
+		getShared().latestCtx = c;
+		getShared().bridge?.captureToolEnd();
+	});
+	pi.on("agent_settled", (_e, c) => {
+		getShared().latestCtx = c;
+		getShared().bridge?.settle();
 	});
 	pi.on("session_shutdown", () => {});
 }
@@ -454,6 +745,7 @@ async function startTelegramSilent(
 		allowlist: file.allowlist ?? [],
 		channelName: "telegram",
 	});
+	attachRuntime(pi, c);
 	gw.onMessage((m) => void c.handleInbound(m));
 	await gw.start();
 	shared.tg.gateway = gw;
@@ -475,6 +767,7 @@ async function startFeishuSilent(
 		allowlist: file.allowlist ?? [],
 		channelName: "feishu",
 	});
+	attachRuntime(pi, c);
 	gw.onMessage((m) => void c.handleInbound(m));
 	await gw.start();
 	shared.feishu.gateway = gw;
