@@ -26,7 +26,7 @@ export interface PiRuntimeHooks {
 	setThinking?: (level: string) => boolean;
 	readHistory?: (n: number) => string[];
 	listWorkspaces?: () => string[];
-	listSessions?: () => Array<{ id: string; title?: string }>;
+	listSessions?: () => Array<{ id: string; title?: string; file?: string }>;
 	switchWorkspace?: (dir: string) => Promise<string>;
 	switchSession?: (idOrIndex: string) => Promise<string>;
 }
@@ -329,10 +329,11 @@ export class ImController {
 					await this.channel.sendText(m.chatId, s.sessionEmpty);
 					return;
 				}
+				const curFile = this.runtime?.sessionFile?.();
 				const shown = list.slice(0, 20);
 				await this.channel.sendText(
 					m.chatId,
-					`${s.sessionTitle(list.length)}\n${shown.map((x, i) => `${i + 1}. ${x.title ?? s.sessionUntitled} (${x.id.slice(0, 8)})`).join("\n")}\n${s.sessionHint}`,
+					`${s.sessionTitle(list.length)}\n${shown.map((x, i) => `${i + 1}. ${(x.title ?? s.sessionUntitled).slice(0, 60)} (${x.id.slice(0, 8)})${curFile && x.file === curFile ? " *" : ""}`).join("\n")}\n${s.sessionHint}`,
 				);
 				return;
 			}

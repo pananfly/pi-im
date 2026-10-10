@@ -11,6 +11,7 @@ import {
 	type ChannelKind,
 	discoverSessionWorkspaces,
 	type FeishuFileConfig,
+	listWorkspaceSessionsSync,
 	mergeWorkspaces,
 	piImDir,
 	readPiImConfig,
@@ -353,17 +354,9 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 			return mergeWorkspaces(shared.workspaces, cur);
 		},
 		listSessions: () => {
+			const cur = shared.latestCtx?.cwd ?? process.cwd();
 			try {
-				const sm = shared.latestCtx?.sessionManager as unknown as
-					| {
-							getSessionId?: () => string;
-							getSessionFile?: () => string | undefined;
-					  }
-					| undefined;
-				const id = sm?.getSessionId?.() ?? "";
-				const file = sm?.getSessionFile?.() ?? "";
-				if (!id && !file) return [];
-				return [{ id: id || file, title: undefined }];
+				return listWorkspaceSessionsSync(cur);
 			} catch {
 				return [];
 			}
@@ -392,12 +385,22 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 			const cmd = shared.cmdCtx;
 			if (!cmd) throw new Error(t().sessionNoCtx);
 			const list = c.runtime?.listSessions?.() ?? [];
-			let target = arg.trim();
-			if (/^\d+$/.test(target)) {
-				const hit = list[Number(target) - 1];
-				if (!hit) throw new Error(t().sessionIndexOut(target));
-				target = hit.id;
+			const q = arg.trim();
+			let target: string | undefined;
+			if (/^\d+$/.test(q)) {
+				const hit = list[Number(q) - 1];
+				if (!hit) throw new Error(t().sessionIndexOut(q));
+				target = hit.file ?? hit.id;
+			} else {
+				// full id / id prefix / absolute .jsonl path
+				const hit =
+					list.find((s) => s.id === q) ??
+					list.find((s) => s.id.startsWith(q)) ??
+					list.find((s) => s.file === q);
+				target = hit?.file ?? hit?.id ?? (q.endsWith(".jsonl") ? q : undefined);
 			}
+			if (!target) throw new Error(t().sessionIndexOut(q));
+			// Pi switchSession expects the session FILE path, not the id.
 			await cmd.switchSession(target);
 			return t().sessionBound(target);
 		},

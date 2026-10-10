@@ -1,3 +1,4 @@
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -180,4 +181,102 @@ export async function recordWorkspace(
 	const next = mergeWorkspaces(prev.workspaces, cwd).slice(0, 20);
 	await saveJsonAtomic(join(dir, "config.json"), { ...prev, workspaces: next });
 	return next;
+}
+
+/** One session row for /sessionlist (file = absolute .jsonl path for switchSession). */
+export interface SessionListItem {
+	id: string;
+	title?: string;
+	file: string;
+}
+
+/** Encode cwd to pi sessions subdir name, e.g. `/a/b` -> `--a-b--`. */
+export function encodeCwdSubdir(cwd: string): string {
+	const stripped = cwd.replace(/^\//, "").replace(/\//g, "-");
+	return `--${stripped}--`;
+}
+
+interface WebIndexEntry {
+	fp?: { size?: number; mtimeMs?: number };
+	info?: {
+		path?: string;
+		id?: string;
+		cwd?: string;
+		firstMessage?: string;
+		messageCount?: number;
+		created?: string;
+		modified?: string;
+	};
+}
+
+/**
+ * List sessions of one workspace, newest first (sync: pi-web index is ~40KB).
+ * Primary: pi-web-session-index.json (has id/cwd/firstMessage/path).
+ * Fallback: scan sessions/<encoded-cwd>/ filenames when index is missing/stale.
+ */
+export function listWorkspaceSessionsSync(
+	cwd: string,
+	agentDir: string = piAgentDir(),
+	maxItems = 50,
+): SessionListItem[] {
+	// --- primary: pi-web index ---
+	try {
+		const indexPath = join(agentDir, "pi-web-session-index.json");
+		if (existsSync(indexPath)) {
+			const raw = readFileSync(indexPath, "utf8");
+			const parsed = JSON.parse(raw) as {
+				entries?: Record<string, WebIndexEntry>;
+			};
+			const entries = parsed.entries ?? {};
+			const rows: Array<SessionListItem & { modified: string }> = [];
+			for (const entry of Object.values(entries)) {
+				const info = entry.info;
+				if (!info || info.cwd !== cwd) continue;
+				if (!info.id || !info.path) continue;
+				rows.push({
+					id: info.id,
+					title: info.firstMessage?.slice(0, 80) || undefined,
+					file: info.path,
+					modified: info.modified ?? info.created ?? "",
+				});
+			}
+			if (rows.length > 0) {
+				rows.sort((a, b) => (b.modified < a.modified ? -1 : 1));
+				return rows.slice(0, maxItems).map(({ id, title, file }) => ({
+					id,
+					title,
+					file,
+				}));
+			}
+		}
+	} catch {
+		// fall through to directory scan
+	}
+	// --- fallback: scan sessions/<encoded-cwd>/ ---
+	try {
+		const sub = join(agentDir, "sessions", encodeCwdSubdir(cwd));
+		if (!existsSync(sub)) return [];
+		const files = readdirSync(sub).filter((f: string) => f.endsWith(".jsonl"));
+		const rows = files
+			.map((f: string) => {
+				const m = f.match(/_([0-9a-f-]{36})\.jsonl$/i);
+				if (!m?.[1]) return null;
+				let mtime = 0;
+				try {
+					mtime = statSync(join(sub, f)).mtimeMs;
+				} catch {
+					mtime = 0;
+				}
+				return { id: m[1] as string, file: join(sub, f), mtime };
+			})
+			.filter((x: unknown): x is { id: string; file: string; mtime: number } =>
+				Boolean(x),
+			)
+			.sort((a: { mtime: number }, b: { mtime: number }) => b.mtime - a.mtime)
+			.slice(0, maxItems)
+			.map(({ id, file }: { id: string; file: string }) => ({ id, file }));
+		return rows;
+	} catch {
+		return [];
+	}
 }
