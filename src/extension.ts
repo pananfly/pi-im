@@ -9,6 +9,7 @@ import type {
 import { parseTuiArgs } from "./commands.js";
 import {
 	type ChannelKind,
+	discoverSessionWorkspaces,
 	type FeishuFileConfig,
 	mergeWorkspaces,
 	piImDir,
@@ -77,7 +78,18 @@ async function refreshSharedMeta(): Promise<void> {
 	const cfg = await readPiImConfig(dir);
 	shared.locale = resolveLocale(process.env, cfg);
 	const cur = shared.latestCtx?.cwd ?? process.cwd();
-	shared.workspaces = mergeWorkspaces(cfg.workspaces, cur);
+	const discovered = await discoverSessionWorkspaces().catch(() => []);
+	const merged = mergeWorkspaces(cfg.workspaces, cur, discovered).slice(0, 20);
+	shared.workspaces = merged;
+	// persist back so history accumulates even without /workspace switches
+	try {
+		if (JSON.stringify(cfg.workspaces ?? []) !== JSON.stringify(merged)) {
+			await saveJsonAtomic(join(dir, "config.json"), {
+				...cfg,
+				workspaces: merged,
+			});
+		}
+	} catch {}
 }
 function notify(
 	ctx: ExtensionCommandContext,
@@ -689,6 +701,17 @@ async function handleFeishu(
 		);
 	}
 }
+/** Track latest ctx + keep current cwd first in workspace list (in-memory). */
+function trackContext(
+	context: import("@earendil-works/pi-coding-agent").ExtensionContext,
+): void {
+	const shared = getShared();
+	shared.latestCtx = context;
+	try {
+		const cur = context.cwd ?? process.cwd();
+		shared.workspaces = mergeWorkspaces(shared.workspaces, cur).slice(0, 20);
+	} catch {}
+}
 export default function piImExtension(pi: ExtensionAPI): void {
 	getShared();
 	pi.registerCommand("feishu", {
@@ -705,12 +728,12 @@ export default function piImExtension(pi: ExtensionAPI): void {
 	});
 	pi.on("session_start", (event, context) => {
 		void event;
-		getShared().latestCtx = context;
+		trackContext(context);
 		void (async () => {
 			const shared = getShared();
+			await refreshSharedMeta().catch(() => undefined);
 			if (shared.autostartDone) return;
 			shared.autostartDone = true;
-			await refreshSharedMeta().catch(() => undefined);
 			const dir = piImDir();
 			const feishuFile = await readJson<FeishuFileConfig>(
 				join(dir, "feishu.json"),
@@ -744,23 +767,23 @@ export default function piImExtension(pi: ExtensionAPI): void {
 		});
 	});
 	pi.on("message_end", (e, c) => {
-		getShared().latestCtx = c;
+		trackContext(c);
 		getShared().bridge?.captureMessage(e.message as never);
 	});
 	pi.on("message_update", (e, c) => {
-		getShared().latestCtx = c;
+		trackContext(c);
 		getShared().bridge?.captureStreamingMessage(e.message as never);
 	});
 	pi.on("tool_execution_start", (e, c) => {
-		getShared().latestCtx = c;
+		trackContext(c);
 		getShared().bridge?.captureToolStart(e.toolName as string);
 	});
 	pi.on("tool_execution_end", (_e, c) => {
-		getShared().latestCtx = c;
+		trackContext(c);
 		getShared().bridge?.captureToolEnd();
 	});
 	pi.on("agent_settled", (_e, c) => {
-		getShared().latestCtx = c;
+		trackContext(c);
 		getShared().bridge?.settle();
 	});
 	pi.on("session_shutdown", () => {});
