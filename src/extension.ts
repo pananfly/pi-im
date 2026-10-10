@@ -108,6 +108,14 @@ function mask(s: string): string {
 	if (s.length <= 8) return "****";
 	return `${s.slice(0, 4)}…${s.slice(-4)}`;
 }
+/** Pi 侧会话替换后缓存的命令上下文会失效（stale），需提示用户刷新。 */
+function isStaleCtxError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		message.includes("extension ctx is stale") ||
+		message.includes("ctx is stale after session replacement")
+	);
+}
 async function validateTelegramToken(botToken: string): Promise<string> {
 	const res = await fetch(`https://api.telegram.org/bot${botToken}/getMe`, {
 		signal: AbortSignal.timeout(15000),
@@ -145,12 +153,22 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 	c.runtime = {
 		newSession: async () => {
 			const cmd = shared.cmdCtx;
-			if (!cmd) return false;
+			if (!cmd) throw new Error(t().sessionNoCtx);
+			if (shared.latestCtx?.isIdle() === false) throw new Error(t().newBusy);
 			try {
-				const r = await cmd.newSession();
+				const r = await cmd.newSession({
+					withSession: async (next) => {
+						shared.cmdCtx = next;
+						shared.latestCtx = next;
+					},
+				});
 				return !r.cancelled;
-			} catch {
-				return false;
+			} catch (e) {
+				if (isStaleCtxError(e)) {
+					shared.cmdCtx = null;
+					throw new Error(t().sessionStale);
+				}
+				throw e;
 			}
 		},
 		compact: () => {
@@ -401,7 +419,20 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 			}
 			if (!target) throw new Error(t().sessionIndexOut(q));
 			// Pi switchSession expects the session FILE path, not the id.
-			await cmd.switchSession(target);
+			try {
+				await cmd.switchSession(target, {
+					withSession: async (next) => {
+						shared.cmdCtx = next;
+						shared.latestCtx = next;
+					},
+				});
+			} catch (e) {
+				if (isStaleCtxError(e)) {
+					shared.cmdCtx = null;
+					throw new Error(t().sessionStale);
+				}
+				throw e;
+			}
 			return t().sessionBound(target);
 		},
 	};

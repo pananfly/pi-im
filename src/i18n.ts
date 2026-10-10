@@ -95,6 +95,9 @@ const zh = {
 	sessionBound: (id: string) => `已绑定会话: ${id}`,
 	sessionNoCtx:
 		"本地暂无可用的会话切换上下文,请先在 TUI 执行一次 /tg status 后重试。",
+	sessionStale:
+		"本地 Pi 会话控制已过期（本地发生过会话切换）。请在 Pi Web/TUI 执行一次 /tg status 刷新，然后重发这条消息。",
+	newBusy: "任务运行中,请先 /stop 再 /new。",
 	cmdFallback: (name: string, args: string) =>
 		`命令 ${name} ${args} 已收到(V1最小实现)。`,
 	// help
@@ -187,6 +190,9 @@ const en: Strings = {
 	sessionBound: (id: string) => `Bound session: ${id}`,
 	sessionNoCtx:
 		"No session-switch context yet, run /tg status once in TUI first.",
+	sessionStale:
+		"Local Pi session control expired (session switched locally). Run /tg status once in Pi Web/TUI to refresh, then resend.",
+	newBusy: "Task running, /stop first then /new.",
 	cmdFallback: (name: string, args: string) =>
 		`Command ${name} ${args} received (V1 stub).`,
 	help: "/help /status /version /new /stop /steer <text> /compact /history [N] /models /model [number|ID] /thinking [ID] (/reasoning) /workspace <path|number> (/ws) /wsl /sessionlist (/sessions) /session <ID|number> /batch /send /cancel /repair /clear",

@@ -189,8 +189,15 @@ export class ImController {
 			}
 			case "/new":
 				if (this.runtime?.newSession) {
-					const ok = await this.runtime.newSession();
-					await this.channel.sendText(m.chatId, ok ? s.newDone : s.newFail);
+					try {
+						const ok = await this.runtime.newSession();
+						await this.channel.sendText(m.chatId, ok ? s.newDone : s.newFail);
+					} catch (e) {
+						await this.channel.sendText(
+							m.chatId,
+							e instanceof Error ? e.message : s.newFail,
+						);
+					}
 				} else {
 					await this.channel.sendText(m.chatId, s.newUnbound);
 				}
