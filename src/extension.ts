@@ -49,6 +49,8 @@ interface SharedState {
 	release: (() => void) | null;
 	latestCtx: import("@earendil-works/pi-coding-agent").ExtensionContext | null;
 	cmdCtx: ExtensionCommandContext | null;
+	/** holder 会话文件：IM 实际控制的会话。被动事件只接受该会话，显式命令则重新认领。 */
+	holderFile: string | null;
 	locale: Locale;
 	workspaces: string[];
 }
@@ -63,6 +65,7 @@ function getShared(): SharedState {
 			release: null,
 			latestCtx: null,
 			cmdCtx: null,
+			holderFile: null,
 			locale: "zh" as Locale,
 			workspaces: [],
 		};
@@ -70,7 +73,44 @@ function getShared(): SharedState {
 	const s = host[SKEY] as SharedState;
 	if (!s.locale) s.locale = "zh";
 	if (!s.workspaces) s.workspaces = [];
+	if (!("holderFile" in s)) s.holderFile = null;
 	return s;
+}
+/** 安全读取会话文件路径（stale ctx 可能抛错）。 */
+function ctxSessionFile(
+	ctx:
+		| import("@earendil-works/pi-coding-agent").ExtensionContext
+		| null
+		| undefined,
+): string | undefined {
+	try {
+		return ctx?.sessionManager.getSessionFile() ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+/**
+ * 认领控制会话（显式 TUI 命令 / withSession 回调专用）：
+ * holder 跟随最后一次显式操作，解决 pi-web 多会话事件互相覆盖问题。
+ */
+function adoptControlSession(
+	ctx: import("@earendil-works/pi-coding-agent").ExtensionContext,
+	isCommand: boolean,
+): void {
+	const shared = getShared();
+	shared.latestCtx = ctx;
+	if (isCommand) {
+		shared.cmdCtx = ctx as ExtensionCommandContext;
+		const f = ctxSessionFile(ctx);
+		if (f) shared.holderFile = f;
+	} else if (!shared.holderFile) {
+		const f = ctxSessionFile(ctx);
+		if (f) shared.holderFile = f;
+	}
+	try {
+		const cur = ctx.cwd ?? process.cwd();
+		shared.workspaces = mergeWorkspaces(shared.workspaces, cur).slice(0, 20);
+	} catch {}
 }
 /** Refresh locale + workspace history from disk (called on commands/autostart). */
 async function refreshSharedMeta(): Promise<void> {
@@ -158,8 +198,7 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 			try {
 				const r = await cmd.newSession({
 					withSession: async (next) => {
-						shared.cmdCtx = next;
-						shared.latestCtx = next;
+						adoptControlSession(next, true);
 					},
 				});
 				return !r.cancelled;
@@ -413,8 +452,7 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 			try {
 				const result = await cmd.switchSession(first.file, {
 					withSession: async (next) => {
-						shared.cmdCtx = next;
-						shared.latestCtx = next;
+						adoptControlSession(next, true);
 						switched = true;
 					},
 				});
@@ -456,8 +494,7 @@ function attachRuntime(pi: ExtensionAPI, c: ImController): void {
 			try {
 				const result = await cmd.switchSession(target, {
 					withSession: async (next) => {
-						shared.cmdCtx = next;
-						shared.latestCtx = next;
+						adoptControlSession(next, true);
 						switched = true;
 					},
 				});
@@ -510,7 +547,7 @@ async function startTelegram(
 	await gw.start();
 	shared.tg.gateway = gw;
 	shared.tg.controller = c;
-	shared.cmdCtx = ctx;
+	adoptControlSession(ctx, true);
 	notify(ctx, `✅ TG Bot 已就绪(@${username})。私聊直回,群聊@回。`, "info");
 }
 async function stopTelegram(ctx: ExtensionCommandContext): Promise<void> {
@@ -560,7 +597,7 @@ async function startFeishu(
 	await gw.start();
 	shared.feishu.gateway = gw;
 	shared.feishu.controller = c;
-	shared.cmdCtx = ctx;
+	adoptControlSession(ctx, true);
 	notify(ctx, "✅ 飞书网关已启动(WebSocket)。私聊直回,群聊@回。", "info");
 }
 async function stopFeishu(ctx: ExtensionCommandContext): Promise<void> {
@@ -581,7 +618,7 @@ async function handleTg(
 ): Promise<void> {
 	const { cmd, rest } = parseTuiArgs(rawArgs || "help");
 	const dir = piImDir();
-	getShared().cmdCtx = ctx;
+	adoptControlSession(ctx, true);
 	await refreshSharedMeta().catch(() => undefined);
 	try {
 		switch (cmd) {
@@ -679,7 +716,7 @@ async function handleFeishu(
 ): Promise<void> {
 	const { cmd, rest } = parseTuiArgs(rawArgs || "help");
 	const dir = piImDir();
-	getShared().cmdCtx = ctx;
+	adoptControlSession(ctx, true);
 	await refreshSharedMeta().catch(() => undefined);
 	try {
 		switch (cmd) {
@@ -777,11 +814,21 @@ function trackContext(
 	context: import("@earendil-works/pi-coding-agent").ExtensionContext,
 ): void {
 	const shared = getShared();
-	shared.latestCtx = context;
-	try {
-		const cur = context.cwd ?? process.cwd();
-		shared.workspaces = mergeWorkspaces(shared.workspaces, cur).slice(0, 20);
-	} catch {}
+	// 被动事件：只接受 holder 会话，过滤 pi-web 其他浏览器会话的噪音。
+	if (!shared.holderFile) {
+		adoptControlSession(context, false);
+		return;
+	}
+	const f = ctxSessionFile(context);
+	if (f && f === shared.holderFile) {
+		shared.latestCtx = context;
+		try {
+			const cur = context.cwd ?? process.cwd();
+			shared.workspaces = mergeWorkspaces(shared.workspaces, cur).slice(0, 20);
+		} catch {}
+	}
+	// 文件对不上（其他会话的事件 / 浏览器侧新建会话）一律忽略，
+	// 等用户在 holder 会话执行 /tg status 显式认领后再跟随。
 }
 export default function piImExtension(pi: ExtensionAPI): void {
 	getShared();
