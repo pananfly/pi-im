@@ -28,4 +28,13 @@ describe("parse", () => {
 	it("non-command", () => {
 		expect(parseRemoteCommand("hello")).toBeUndefined();
 	});
+	it("does not gate on KNOWN: unknown commands pass through", () => {
+		// The controller's switch is the only gate. If parsing started rejecting
+		// unknown names, "no such command" replies would silently become model
+		// prompts instead.
+		expect(parseRemoteCommand("/nope a b")).toEqual({
+			name: "/nope",
+			args: "a b",
+		});
+	});
 });

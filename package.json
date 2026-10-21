@@ -3,15 +3,39 @@
 	"version": "0.1.2",
 	"type": "module",
 	"license": "MIT",
+	"description": "Pi 双通道 IM 插件:飞书 + Telegram,共享主会话,远程驱动 coding agent",
+	"keywords": [
+		"pi",
+		"pi-coding-agent",
+		"pi-extension",
+		"coding-agent",
+		"telegram",
+		"telegram-bot",
+		"feishu",
+		"lark",
+		"im",
+		"bot",
+		"chatops",
+		"remote-control"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/pananfly/pi-im.git"
+	},
+	"homepage": "https://github.com/pananfly/pi-im#readme",
+	"bugs": {
+		"url": "https://github.com/pananfly/pi-im/issues"
+	},
 	"publishConfig": {
 		"access": "public"
 	},
 	"pi": {
 		"extensions": [
-			"./dist/extension.js"
+			"./index.js"
 		]
 	},
 	"files": [
+		"index.js",
 		"dist",
 		"scripts",
 		"README.md",
@@ -21,7 +45,8 @@
 		"build": "tsc -p tsconfig.build.json",
 		"check": "biome check . && tsc --noEmit",
 		"test": "vitest run",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"prepublishOnly": "npm run check && npm run test && npm run build"
 	},
 	"dependencies": {
 		"@larksuiteoapi/node-sdk": "1.72.0"
