@@ -1,6 +1,6 @@
 {
 	"name": "@pananfly/pi-im",
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"type": "module",
 	"license": "MIT",
 	"description": "Pi 双通道 IM 插件:飞书 + Telegram,共享主会话,远程驱动 coding agent",
