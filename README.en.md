@@ -140,6 +140,14 @@ this order:
 > target session is already open in the browser, the switch lands on **that**
 > conversation instead of opening a copy, and by the time the call returns the
 > new session's extensions have begun rebinding.
+>
+> **Only one process per machine runs IM.** With a TUI and pi-web both running
+> the TUI wins: the owner is recorded in `~/.pi/agent/pi-im/owner.json` (heartbeat
+> every 10 s), a starting TUI takes IM over, and pi-web drops back to standby — it
+> stops long-polling Telegram, stops the Feishu websocket, and no longer adopts
+> whatever session you click in the browser. When the TUI exits, pi-web takes over
+> once the heartbeat goes stale (30 s) and resumes the session pinned in
+> `config.json`, so IM never goes mute. Two TUIs keep the first one running.
 
 ### Batch input
 

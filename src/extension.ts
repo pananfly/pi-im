@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
+	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { parseTuiArgs } from "./commands.js";
 import {
@@ -37,6 +38,12 @@ import { SdkFeishuGateway } from "./feishu/gateway.js";
 import { syncSlashCommands } from "./feishu/slash-commands.js";
 import { getStrings, type Locale, resolveLocale } from "./i18n.js";
 import { registerPiWebLiveness } from "./liveness.js";
+import {
+	OWNER_HEARTBEAT_MS,
+	type OwnerLock,
+	openOwnerLock,
+	type ProcessMode,
+} from "./owner.js";
 import { PiAgentBridge } from "./pi-bridge.js";
 import {
 	getCurrentPi,
@@ -128,6 +135,20 @@ interface SharedState {
 	pendingSwitchAt: number | null;
 	locale: Locale;
 	workspaces: string[];
+	/**
+	 * The host mode this process runs in — "tui" in a terminal, "rpc" under
+	 * pi-web — or null until the first `session_start` reports it. Only a known
+	 * mode turns on cross-process arbitration: a host that never says which it is
+	 * keeps the old single-process behaviour, which is also what every existing
+	 * test expects.
+	 */
+	ownerMode: ProcessMode | null;
+	/** This process's IM lock; null until the mode is known (see src/owner.ts). */
+	owner: OwnerLock | null;
+	/** The newest `session_start`, so a regained owner can act without waiting for one. */
+	sessionStart: { context: ExtensionContext; api: ExtensionAPI } | null;
+	/** Guards the regained-owner restore against overlapping runs. */
+	restoring: boolean;
 }
 /** How long an IM-issued switch may wait for pi-web to mint the replacement wrapper. */
 const PENDING_SWITCH_TTL_MS = 20_000;
@@ -153,6 +174,10 @@ function getShared(): SharedState {
 			pendingSwitchAt: null,
 			locale: "zh" as Locale,
 			workspaces: [],
+			ownerMode: null,
+			owner: null,
+			sessionStart: null,
+			restoring: false,
 		};
 	}
 	const s = host[SKEY] as SharedState;
@@ -171,6 +196,10 @@ function getShared(): SharedState {
 	if (!("holderSeed" in legacy)) s.holderSeed = null;
 	if (!("pendingSwitchAt" in legacy)) s.pendingSwitchAt = null;
 	if (!("autostartPromise" in legacy)) s.autostartPromise = null;
+	if (!("ownerMode" in legacy)) s.ownerMode = null;
+	if (!("owner" in legacy)) s.owner = null;
+	if (!("sessionStart" in legacy)) s.sessionStart = null;
+	if (!("restoring" in legacy)) s.restoring = false;
 	seedHolderFromDisk(s);
 	return s;
 }
@@ -526,12 +555,235 @@ function autostartBots(): Promise<void> {
 	}
 	return shared.autostartPromise;
 }
+/**
+ * The host mode, if pi named one.
+ *
+ * `ctx.mode` is the only way to tell the TUI apart from pi-web from inside a pi
+ * process: both are plain Node processes, and neither argv nor stdout reveals the
+ * difference. A host that does not report one (an older pi, a test harness that
+ * omits it) yields null, which leaves arbitration off entirely — the single
+ * process assumption that was true before pi-web.
+ */
+function processModeOf(mode: unknown): ProcessMode | null {
+	if (mode === "tui" || mode === "rpc" || mode === "json" || mode === "print") {
+		return mode;
+	}
+	return null;
+}
+/** Whether this process may drive IM, treating an unnamed host as the only one. */
+function isImOwner(): boolean {
+	const shared = getShared();
+	if (shared.ownerMode === null) return true;
+	return shared.owner?.owned === true;
+}
+/** Strict variant: arbitration is on AND this process won it. */
+function holdsImLock(): boolean {
+	const shared = getShared();
+	return shared.ownerMode !== null && shared.owner?.owned === true;
+}
+/**
+ * Drop both gateways without a word to the user.
+ *
+ * Called when another process takes IM over: the loser must go quiet, or
+ * Telegram keeps answering this process' long-poll with 409 while Feishu keeps a
+ * second websocket open, and whichever process wins the race per update is
+ * effectively random — that is the "IM answered in the wrong session" bug.
+ */
+async function stopAllChannels(): Promise<void> {
+	const shared = getShared();
+	const feishu = shared.feishu.gateway;
+	const tg = shared.tg.gateway;
+	shared.feishu = { gateway: null, controller: null };
+	shared.tg = { gateway: null, controller: null };
+	shared.release?.();
+	shared.release = null;
+	// Not "done", just "not ours for now": regaining the lock must be able to
+	// start the bots again.
+	shared.autostartDone = false;
+	shared.autostartPromise = null;
+	await Promise.allSettled([feishu?.stop(), tg?.stop()]);
+}
+/**
+ * Heartbeat period of the IM lock.
+ *
+ * Only tests need to shorten it (`PIIM_OWNER_HEARTBEAT_MS`), the same way
+ * `PIIM_REBIND_TIMEOUT_MS` shortens the command-context poll.
+ */
+function ownerHeartbeatMs(): number {
+	const raw = Number(process.env.PIIM_OWNER_HEARTBEAT_MS ?? "");
+	if (Number.isFinite(raw) && raw >= 5) return raw;
+	return OWNER_HEARTBEAT_MS;
+}
+/**
+ * Claim (or queue for) the cross-process IM lock, once per process.
+ *
+ * `session_start` is the first moment pi tells us which mode we run in, and it
+ * is called synchronously so the claim is in place before `mayAdoptHolder` reads
+ * it. The lock is never released early: it lives as long as the process, and
+ * src/owner.ts unlinks the file on exit.
+ */
+function ensureOwnership(mode: ProcessMode | null): void {
+	if (!mode) return;
+	const shared = getShared();
+	if (shared.ownerMode === null) shared.ownerMode = mode;
+	if (shared.owner) return;
+	const lock = openOwnerLock({
+		file: join(piImDir(), "owner.json"),
+		mode,
+		heartbeatMs: ownerHeartbeatMs(),
+		onLost: () => {
+			imDebug("owner", "lost", mode);
+			void stopAllChannels().catch(() => undefined);
+		},
+		onRegain: () => {
+			imDebug("owner", "regained", mode);
+			// The bot startup was marked done while we were only the fallback, so it
+			// has to be re-armed before autostartBots() can do anything.
+			const s = getShared();
+			s.autostartDone = false;
+			s.autostartPromise = null;
+			void (async () => {
+				await autostartBots();
+				await restorePinnedHolder();
+			})().catch(() => undefined);
+		},
+	});
+	shared.owner = lock;
+	imDebug("owner", lock.owned ? "claimed" : "queued", mode, process.pid);
+}
+/** The session file behind a persisted holder record, or null when it is gone. */
+function resolveSeedSessionFile(seed: HolderRecord): string | null {
+	if (seed.sessionFile && existsSyncSafe(seed.sessionFile))
+		return seed.sessionFile;
+	const id = seed.sessionId ?? "";
+	const cwd = seed.cwd ?? "";
+	if (!id || !cwd) return null;
+	try {
+		const hit = listWorkspaceSessionsSync(cwd).find(
+			(s) => s.id === id || s.id.startsWith(id),
+		);
+		if (hit?.file && existsSyncSafe(hit.file)) return hit.file;
+	} catch {}
+	return null;
+}
+/** Poll for the command context pi hands to a dispatched command. */
+async function waitForCommandContext(): Promise<ExtensionCommandContext | null> {
+	const shared = getShared();
+	const start = shared.sessionStart;
+	if (start) claimCommandContext(start.api);
+	const deadline = Date.now() + rebindTimeoutMs();
+	for (;;) {
+		if (shared.cmdCtx) return shared.cmdCtx;
+		if (Date.now() >= deadline) return null;
+		await new Promise((r) => setTimeout(r, REBIND_POLL_MS));
+	}
+}
+/**
+ * Pin the session this process is already on.
+ *
+ * The last resort of a takeover, for when there is nothing to resume: a process
+ * that was only the fallback never adopted anything (see mayAdoptHolder), so it
+ * sits on some session the host opened for it and IM would come back online with
+ * nothing to drive — commands would answer "未就绪" until the user clicked a tab
+ * in the browser. Adopting what we already have keeps IM usable right away.
+ */
+function adoptCurrentSession(): boolean {
+	const shared = getShared();
+	if (shared.holderAdopted) return true;
+	const start = shared.sessionStart;
+	if (!start) return false;
+	const ident = holderIdentityOf(start.context);
+	if (!ident.sessionFile && !ident.sessionId) return false;
+	adoptControlSession(start.context, false, start.api, "auto");
+	claimCommandContext(start.api);
+	return true;
+}
+/**
+ * Bring the pinned conversation back after this process takes IM over.
+ *
+ * A process that owns IM from the start is already oriented: warmup resumes the
+ * record and its own `session_start` adopts it. A process that was only the
+ * fallback never adopted anything (by rule, see mayAdoptHolder), so the only
+ * target it knows is the record on disk — resume it the way /session does, or
+ * keep whatever session it is on when there is no record to resume.
+ *
+ * Failure is logged and dropped, never retried: the user may have deleted that
+ * session, and a background retry loop would keep yanking the browser off
+ * whichever tab they just opened.
+ */
+async function restorePinnedHolder(): Promise<void> {
+	const shared = getShared();
+	if (!holdsImLock()) return;
+	if (shared.restoring) return;
+	const seed = shared.holderSeed;
+	if (!seed) {
+		// Nothing was ever pinned: take over with the session we have.
+		if (adoptCurrentSession()) imDebug("owner", "restore-adopted", "no-pin");
+		return;
+	}
+	if (
+		shared.holderAdopted &&
+		matchesSeed(seed, holderIdentityOf(shared.latestCtx))
+	) {
+		return;
+	}
+	const target = resolveSeedSessionFile(seed);
+	if (!target) {
+		// The pinned session is gone (deleted, or another machine): same fallback.
+		imDebug("owner", "restore-skip", "no-session-file");
+		adoptCurrentSession();
+		return;
+	}
+	shared.restoring = true;
+	try {
+		const cmd = shared.cmdCtx ?? (await waitForCommandContext());
+		if (!cmd) {
+			imDebug("owner", "restore-skip", "no-command-context");
+			return;
+		}
+		const before = shared.cmdCtx;
+		let switched = false;
+		shared.pendingSwitchAt = Date.now();
+		try {
+			const result = await cmd.switchSession(target, {
+				withSession: async (next) => {
+					adoptControlSession(next, true, undefined, "explicit");
+					switched = true;
+				},
+			});
+			if (result.cancelled) {
+				shared.pendingSwitchAt = null;
+				imDebug("owner", "restore-cancelled");
+				return;
+			}
+		} catch (e) {
+			shared.pendingSwitchAt = null;
+			if (isStaleApiError(e)) shared.cmdCtx = null;
+			imDebug(
+				"owner",
+				"restore-failed",
+				e instanceof Error ? e.message : String(e),
+			);
+			return;
+		}
+		const landed = await landedOnNewSession(switched, before);
+		imDebug("owner", "restored", target, landed ? "landed" : "unconfirmed");
+	} finally {
+		shared.restoring = false;
+	}
+}
 async function runAutostart(): Promise<void> {
 	try {
 		await refreshSharedMeta();
 	} catch {
 		// 元信息刷新失败不阻断启动
 	}
+	// Two processes (TUI + pi-web) must not both poll: only the IM owner runs
+	// bots. The mode is unknown this early (it arrives with the first
+	// session_start), so a fallback may get here once with gateways already up —
+	// session_start stops them right after the claim (see stopAllChannels call
+	// there), and the start helpers refuse a gateway that lost the lock mid-start.
+	if (!isImOwner()) return;
 	const dir = piImDir();
 	const feishuFile = await readJson<FeishuFileConfig>(
 		join(dir, "feishu.json"),
@@ -543,13 +795,24 @@ async function runAutostart(): Promise<void> {
 	);
 	getBridge();
 	const fCred = resolveFeishuCredentials(process.env, feishuFile);
-	if (fCred && shouldAutoStart("feishu", process.env, feishuFile)) {
+	if (
+		fCred &&
+		shouldAutoStart("feishu", process.env, feishuFile) &&
+		isImOwner()
+	) {
 		await startFeishuSilent(fCred, feishuFile).catch(() => undefined);
 	}
 	const tCred = resolveTelegramCredentials(process.env, tgFile);
-	if (tCred && shouldAutoStart("telegram", process.env, tgFile)) {
+	if (
+		tCred &&
+		shouldAutoStart("telegram", process.env, tgFile) &&
+		isImOwner()
+	) {
 		await startTelegramSilent(tCred, tgFile).catch(() => undefined);
 	}
+	// The lock can be lost while a gateway is coming up (a TUI started in
+	// parallel); the loser must not keep serving.
+	if (!isImOwner()) await stopAllChannels();
 }
 /**
  * Re-apply the model the user last picked over IM.
@@ -1578,6 +1841,9 @@ function trackContext(
  * a workspace" path — so an unconditional adopt here is exactly what used to
  * change the IM task's cwd out from under it.
  *
+ *  - and never at all when another process holds the lock (a TUI running next to
+ *    pi-web): the fallback has to stay where it is until it takes IM over.
+ *
  * Allowed, in order:
  *  - an IM switch is in flight (pi-web's wrapper is brand new and reports no
  *    previousSessionFile) → explicit;
@@ -1601,6 +1867,10 @@ function mayAdoptHolder(
 	context: import("@earendil-works/pi-coding-agent").ExtensionContext,
 ): { source: "auto" | "explicit" | "restored" } | null {
 	const shared = getShared();
+	// A fallback process must never move the pin. When pi-web runs next to a TUI
+	// its every browser click is a `session_start` in this process, and adopting
+	// it there is what dragged IM's workspace and session into the clicked tab.
+	if (!isImOwner()) return null;
 	if (shared.pendingSwitchAt !== null) {
 		if (Date.now() - shared.pendingSwitchAt <= PENDING_SWITCH_TTL_MS) {
 			return { source: "explicit" };
@@ -1643,6 +1913,8 @@ export default function piImExtension(pi: ExtensionAPI): void {
 	// The holder's session_start pins it via adoptControlSession() instead.
 	getShared();
 	// 不依赖任何会话：extension 加载即尝试拉起 Telegram / Feishu 网关。
+	// 但只在没有别的 pi 进程持有 IM 时真的联网（见 runAutostart 的 ownership 门），
+	// 否则 TUI + pi-web 会各开一条长轮询，谁抢到更新谁回答。
 	void autostartBots().catch(() => undefined);
 	pi.registerCommand("feishu", {
 		description:
@@ -1678,7 +1950,18 @@ export default function piImExtension(pi: ExtensionAPI): void {
 			// The replacement wrapper reports its session_start first in practice
 			// (which flips holderFile); the pending marker is the fallback for the
 			// reverse order and for hosts that only dispatch the command.
-			if (identified && !isHolderContext(ctx) && !pendingFresh) return;
+			// An IM owner that has pinned nothing yet is the other exception: that is
+			// exactly the state of a fallback process right after taking over, and it
+			// needs the handle to resume the recorded session. It cannot move the pin
+			// by itself — mayAdoptHolder already answered "no" for this session.
+			if (
+				identified &&
+				!isHolderContext(ctx) &&
+				!pendingFresh &&
+				!(holdsImLock() && !shared.holderAdopted)
+			) {
+				return;
+			}
 			const source =
 				pendingFresh && !isHolderContext(ctx)
 					? "explicit"
@@ -1700,12 +1983,28 @@ export default function piImExtension(pi: ExtensionAPI): void {
 		}).catch(() => undefined);
 	});
 	pi.on("session_start", (event, context) => {
+		// This event is the only place pi tells us which host we are ("tui" or
+		// "rpc"), and the claim must be in place before mayAdoptHolder reads it —
+		// hence synchronous, before the (equally synchronous) decision below.
+		ensureOwnership(processModeOf(context.mode));
+		const shared = getShared();
+		shared.sessionStart = { context, api: pi };
+		if (!isImOwner()) {
+			// We may have started bots at factory time, when the mode was still
+			// unknown. Now that another process owns IM, go quiet before serving a
+			// single update: two pollers means neither can claim them reliably.
+			void stopAllChannels().catch(() => undefined);
+		}
 		// Decided synchronously: a browser-opened session must not slip in while an
 		// async refresh runs. The holder was seeded in getShared().
 		const decision = mayAdoptHolder(event, context);
 		if (decision) {
 			setCurrentPi(pi);
 			adoptControlSession(context, false, pi, decision.source);
+			claimCommandContext(pi);
+		} else if (holdsImLock() && !shared.holderAdopted) {
+			// Owner with nothing pinned: it still needs session control, so that a
+			// takeover can resume the recorded conversation (restorePinnedHolder).
 			claimCommandContext(pi);
 		}
 		void (async () => {
@@ -1786,6 +2085,13 @@ async function startTelegramSilent(
 	attachRuntime(c);
 	gw.onMessage((m) => dispatchInbound(c, m, "telegram"));
 	await gw.start();
+	// The lock can be lost while start() is in flight (a TUI claimed IM in the
+	// same second). Storing the gateway anyway would leave a fallback polling
+	// next to the owner forever, so close it and let the owner serve.
+	if (!isImOwner()) {
+		await gw.stop().catch(() => undefined);
+		return;
+	}
 	shared.tg.gateway = gw;
 	shared.tg.controller = c;
 }
@@ -1810,6 +2116,12 @@ async function startFeishuSilent(
 	attachRuntime(c);
 	gw.onMessage((m) => dispatchInbound(c, m, "feishu"));
 	await gw.start();
+	// Same race as the Telegram path: a lock lost mid-start must not leave a
+	// second websocket serving the same bot.
+	if (!isImOwner()) {
+		await gw.stop().catch(() => undefined);
+		return;
+	}
 	shared.feishu.gateway = gw;
 	shared.feishu.controller = c;
 	// The Feishu "/" panel is server-side state this integration owns, so
