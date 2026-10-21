@@ -1,9 +1,12 @@
+import { isAbsolute } from "node:path";
 import { getStrings, type Locale } from "./i18n.js";
 export interface ParsedRemoteCommand {
 	name: string;
 	args: string;
 }
-const KNOWN = [
+/** Every remote command name the IM controller answers. Exported so the
+ *  Feishu slash-command panel can be checked against it in tests. */
+export const KNOWN = [
 	"/help",
 	"/status",
 	"/version",
@@ -27,6 +30,7 @@ const KNOWN = [
 	"/cancel",
 	"/repair",
 	"/clear",
+	"/feishu",
 ];
 export function parseRemoteCommand(
 	input: string,
@@ -34,10 +38,12 @@ export function parseRemoteCommand(
 	const t = input.trim();
 	if (!t.startsWith("/")) return undefined;
 	const i = t.search(/\s/);
-	const name = (i === -1 ? t : t.slice(0, i)).toLowerCase();
-	if (!KNOWN.includes(name))
-		return { name, args: i === -1 ? "" : t.slice(i + 1).trim() };
-	return { name, args: i === -1 ? "" : t.slice(i + 1).trim() };
+	const rawName = (i === -1 ? t : t.slice(0, i)).toLowerCase();
+	// Strip @botname in Telegram group commands (e.g. /status@my_bot -> /status)
+	const at = rawName.indexOf("@");
+	const name = at > 0 ? rawName.slice(0, at) : rawName;
+	const args = i === -1 ? "" : t.slice(i + 1).trim();
+	return { name, args };
 }
 export function renderHelp(locale: Locale = "zh"): string {
 	return [getStrings(locale).help].join("\n");
@@ -56,6 +62,6 @@ export function parseWorkspaceArg(
 		const i = Number(t) - 1;
 		return workspaces[i] ?? null;
 	}
-	if (t.startsWith("/")) return t;
+	if (t.startsWith("/") || isAbsolute(t) || /^[a-zA-Z]:[\\/]/.test(t)) return t;
 	return null;
 }

@@ -3,7 +3,11 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { encodeCwdSubdir, listWorkspaceSessionsSync } from "../src/config.js";
+import {
+	encodeCwdSubdir,
+	listWorkspaceSessionsSync,
+	samePath,
+} from "../src/config.js";
 
 function makeAgentDir(): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-im-sess-"));
@@ -84,5 +88,46 @@ describe("listWorkspaceSessionsSync", () => {
 		expect(encodeCwdSubdir("/Users/pan/Documents/Project/pi-im")).toBe(
 			"--Users-pan-Documents-Project-pi-im--",
 		);
+		expect(encodeCwdSubdir("C:\\Users\\pan\\Project\\pi-im")).toBe(
+			"--C--Users-pan-Project-pi-im--",
+		);
+	});
+
+	it("normalizes like pi does before encoding", () => {
+		// pi runs the cwd through path.resolve first, so a trailing separator or a
+		// "." segment never reaches the sessions/<name>/ directory it writes.
+		expect(encodeCwdSubdir("/tmp/proj/")).toBe("--tmp-proj--");
+		expect(encodeCwdSubdir("/tmp/./proj")).toBe("--tmp-proj--");
+		expect(encodeCwdSubdir("C:\\Users\\pan\\Project\\pi-im\\")).toBe(
+			"--C--Users-pan-Project-pi-im--",
+		);
+		expect(encodeCwdSubdir("/")).toBe("----");
+	});
+});
+
+describe("samePath", () => {
+	it("matches equivalent spellings of one directory", () => {
+		expect(samePath("/tmp/proj/", "/tmp/proj")).toBe(true);
+		expect(samePath("/tmp/proj/../proj", "/tmp/proj")).toBe(true);
+		expect(samePath("proj", "proj")).toBe(true);
+	});
+
+	it("does not match different or missing paths", () => {
+		expect(samePath("/tmp/proj", "/tmp/other")).toBe(false);
+		expect(samePath("/tmp/proj", undefined)).toBe(false);
+		expect(samePath(undefined, "/tmp/proj")).toBe(false);
+		// a relative and an absolute path are never assumed equal
+		expect(samePath("proj", "/tmp/proj")).toBe(false);
+	});
+});
+
+describe("listWorkspaceSessionsSync cwd matching", () => {
+	it("finds sessions recorded under an equivalent cwd spelling", () => {
+		const dir = makeAgentDir();
+		const rows = listWorkspaceSessionsSync(
+			"/Users/pan/Documents/Project/pi-opencode-acp/",
+			dir,
+		);
+		expect(rows).toHaveLength(2);
 	});
 });

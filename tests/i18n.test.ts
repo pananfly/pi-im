@@ -19,6 +19,60 @@ describe("i18n", () => {
 	});
 });
 
+describe("version", () => {
+	it("reads the real package version instead of a hardcoded string", async () => {
+		// Self-updating on purpose: bumping package.json must break this test,
+		// which is the whole point. A literal "0.1.0" here would let the banner
+		// keep lying across a release.
+		const { readFile } = await import("node:fs/promises");
+		const { fileURLToPath } = await import("node:url");
+		const pkg = JSON.parse(
+			await readFile(
+				fileURLToPath(new URL("../package.json", import.meta.url)),
+				"utf8",
+			),
+		) as { version: string };
+
+		expect(getStrings("zh").statusVersion).toBe(`pi-im ${pkg.version}`);
+		expect(getStrings("en").statusVersion).toBe(`pi-im ${pkg.version}`);
+	});
+
+	it("never claims a version it did not read", () => {
+		// "unknown" is honest; a stale number is not.
+		for (const l of ["zh", "en"] as const) {
+			expect(getStrings(l).statusVersion).not.toContain("undefined");
+		}
+	});
+
+	it("degrades to unknown when the manifest cannot be read", async () => {
+		// This is the assertion that separates "reads package.json" from
+		// "happens to say 0.1.0 today". A hardcoded constant cannot fail.
+		const { piImVersion } = await import("../src/config.js");
+
+		expect(
+			piImVersion(new URL("./no-such-manifest.json", import.meta.url)),
+		).toBe("unknown");
+	});
+
+	it("falls back to unknown rather than a partial version", async () => {
+		const { piImVersion } = await import("../src/config.js");
+		const { mkdtemp, writeFile } = await import("node:fs/promises");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { pathToFileURL } = await import("node:url");
+		const dir = await mkdtemp(join(tmpdir(), "pi-im-pkg-"));
+
+		// A manifest with no version field must not render as "pi-im undefined".
+		const noVersion = join(dir, "a.json");
+		await writeFile(noVersion, JSON.stringify({ name: "pi-im" }));
+		expect(piImVersion(pathToFileURL(noVersion))).toBe("unknown");
+
+		const malformed = join(dir, "b.json");
+		await writeFile(malformed, "{ not json");
+		expect(piImVersion(pathToFileURL(malformed))).toBe("unknown");
+	});
+});
+
 describe("workspaces history", () => {
 	it("merges current first, dedupes", () => {
 		expect(mergeWorkspaces(["/b", "/a"], "/a")).toEqual(["/a", "/b"]);

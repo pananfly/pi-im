@@ -18,6 +18,19 @@ describe("core", () => {
 		]);
 		expect(order).toEqual([1, 2]);
 	});
+	it("queue survives a failing job", async () => {
+		const q = new SerialMessageQueue();
+		const order: number[] = [];
+		await expect(
+			q.enqueue("a", () => {
+				throw new Error("fail");
+			}),
+		).rejects.toThrow("fail");
+		await q.enqueue("a", () => {
+			order.push(1);
+		});
+		expect(order).toEqual([1]);
+	});
 	it("dedup remembers", () => {
 		const d = new MessageDeduplicator();
 		expect(d.seen("m1")).toBe(false);

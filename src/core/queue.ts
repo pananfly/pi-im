@@ -7,13 +7,16 @@ export class SerialMessageQueue {
 	enqueue(chatId: string, job: () => Promise<void> | void): Promise<void> {
 		this.pending.set(chatId, (this.pending.get(chatId) ?? 0) + 1);
 		const run = this.tail
+			.catch(() => {})
 			.then(async () => {
 				await job();
 			})
 			.finally(() => {
-				const n = (this.pending.get(chatId) ?? 1) - 1;
-				if (n <= 0) this.pending.delete(chatId);
-				else this.pending.set(chatId, n);
+				const cur = this.pending.get(chatId);
+				if (cur !== undefined) {
+					if (cur <= 1) this.pending.delete(chatId);
+					else this.pending.set(chatId, cur - 1);
+				}
 			});
 		this.tail = run;
 		return run;

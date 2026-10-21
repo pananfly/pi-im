@@ -6,6 +6,12 @@ export type TuiCmd =
 	| "status"
 	| "config"
 	| "logout"
+	| "allow"
+	| "deny"
+	| "allowlist"
+	/** Feishu only: the progress presentation for the next turn. */
+	| "card"
+	| "text"
 	| "help";
 export function parseTuiArgs(input: string): { cmd: TuiCmd; rest: string } {
 	const t = input.trim().split(/\s+/);

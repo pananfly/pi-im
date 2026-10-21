@@ -26,7 +26,7 @@ describe("im commands", () => {
 		const sent: string[] = [];
 		const bridge = new PiAgentBridge(async () => {});
 		const c = new ImController(fakeChannel(sent) as never, bridge, {
-			allowlist: [],
+			allowlist: ["u1"],
 			channelName: "telegram",
 		});
 		c.runtime = {
@@ -53,7 +53,7 @@ describe("im commands", () => {
 		const sent: string[] = [];
 		const bridge = new PiAgentBridge(async () => {});
 		const c = new ImController(fakeChannel(sent) as never, bridge, {
-			allowlist: [],
+			allowlist: ["u1"],
 			channelName: "telegram",
 		});
 		c.runtime = {
@@ -78,7 +78,7 @@ describe("im commands", () => {
 		const sent: string[] = [];
 		const bridge = new PiAgentBridge(async () => {});
 		const c = new ImController(fakeChannel(sent) as never, bridge, {
-			allowlist: [],
+			allowlist: ["u1"],
 			channelName: "telegram",
 		});
 		c.runtime = {};
@@ -91,5 +91,73 @@ describe("im commands", () => {
 			timestampMs: Date.now(),
 		});
 		expect(sent.join("\n")).toContain("/thinking high");
+	});
+	it("/steer queues when idle and takes effect in next turn", async () => {
+		const sent: string[] = [];
+		let ranPrompt = "";
+		let bridgeInstance: PiAgentBridge | null = null;
+		const bridge = new PiAgentBridge(async (p) => {
+			ranPrompt = p;
+			bridgeInstance?.captureMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "好的" }],
+			});
+			bridgeInstance?.settle();
+		});
+		bridgeInstance = bridge;
+		const c = new ImController(fakeChannel(sent) as never, bridge, {
+			allowlist: ["u1"],
+			channelName: "telegram",
+		});
+		await c.handleInbound({
+			messageId: "st1",
+			chatId: "c1",
+			chatType: "p2p",
+			senderId: "u1",
+			text: "/steer 请用中文回答",
+			timestampMs: Date.now(),
+		});
+		expect(sent.join("\n")).toContain("将在下一轮生效");
+
+		// Run next turn
+		await c.handleInbound({
+			messageId: "m1",
+			chatId: "c1",
+			chatType: "p2p",
+			senderId: "u1",
+			text: "你好",
+			timestampMs: Date.now(),
+		});
+		expect(ranPrompt).toContain("请用中文回答");
+		expect(ranPrompt).toContain("你好");
+	});
+	it("/send with empty batch replies batchNone without running agent", async () => {
+		const sent: string[] = [];
+		let runCalled = false;
+		const bridge = new PiAgentBridge(async () => {
+			runCalled = true;
+		});
+		const c = new ImController(fakeChannel(sent) as never, bridge, {
+			allowlist: ["u1"],
+			channelName: "telegram",
+		});
+		await c.handleInbound({
+			messageId: "b1",
+			chatId: "c1",
+			chatType: "p2p",
+			senderId: "u1",
+			text: "/batch",
+			timestampMs: Date.now(),
+		});
+		await c.handleInbound({
+			messageId: "b2",
+			chatId: "c1",
+			chatType: "p2p",
+			senderId: "u1",
+			text: "/send",
+			timestampMs: Date.now(),
+		});
+		expect(sent.join("\n")).toContain("无批量任务");
+		expect(runCalled).toBe(false);
 	});
 });
